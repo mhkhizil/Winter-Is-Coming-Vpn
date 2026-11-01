@@ -1,9 +1,12 @@
 # vpn
 
-**Status: pre-alpha (milestone M0). Nothing in this repository terminates a tunnel yet.**
-It is not production-ready, it has never carried customer traffic, and it has no
-interoperability result against any WireGuard® implementation. See
-[`docs/ROADMAP.md`](docs/ROADMAP.md) for the gates that must pass first.
+**Status: M0+M1 core done — the handshake and transport work; interop with the
+official WireGuard client is not yet verified on real hardware.**
+`vpn-dp` is a runnable, statically configured tunnel server: it terminates
+Noise_IK handshakes, authenticates peers from a config file, and encrypts /
+decrypts transport packets (Linux TUN; other platforms run in handshake-only
+mode). It is not yet a multi-tenant service: there is no API, no database and no
+TLS in front of `vpnd`. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
 
 The intended product is a multi-tenant VPN backend in modern C++: a userspace
 server that will terminate **WireGuard®-compatible** tunnels (so we keep control
