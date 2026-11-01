@@ -98,8 +98,8 @@ class TransportSession {
   [[nodiscard]] std::size_t seal(MutableByteSpan dst, ByteSpan inner_packet) noexcept;
 
   // Verifies the counter against the replay window *after* successful AEAD, then
-  // returns a view of the inner packet inside `datagram`.
-  [[nodiscard]] Result<ByteSpan> open(ByteSpan datagram) noexcept;
+  // returns a view of the inner packet, decrypted in place inside `datagram`.
+  [[nodiscard]] Result<ByteSpan> open(MutableByteSpan datagram) noexcept;
 
   [[nodiscard]] std::uint32_t local_index() const noexcept;
   void reset() noexcept;

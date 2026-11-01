@@ -14,7 +14,9 @@ add_library(vpn_core STATIC
   src/crypto/ct.cpp
   src/crypto/kdf.cpp
   src/crypto/random.cpp
+  src/crypto/x25519.cpp
   src/wire/message.cpp
+  src/wire/noise.cpp
   src/wire/replay_window.cpp
   src/config/config.cpp
   src/obs/metrics.cpp

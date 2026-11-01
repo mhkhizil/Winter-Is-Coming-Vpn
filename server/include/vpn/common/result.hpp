@@ -91,6 +91,8 @@ class Status {
   Status(ErrorCode code, std::string message) : code_(code), message_(std::move(message)) {}
 
   [[nodiscard]] bool ok() const noexcept { return code_ == ErrorCode::kNone; }
+  // Lets call sites write `if (st)` / `if (!st)` in addition to `st.ok()`.
+  explicit operator bool() const noexcept { return ok(); }
   [[nodiscard]] ErrorCode code() const noexcept { return code_; }
   [[nodiscard]] const std::string& message() const noexcept { return message_; }
 

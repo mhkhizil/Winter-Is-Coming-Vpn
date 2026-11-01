@@ -8,6 +8,8 @@ add_executable(vpn_unit_tests
   unit/test_aead.cpp
   unit/test_blake2s.cpp
   unit/test_wire_message.cpp
+  unit/test_noise.cpp
+  unit/test_x25519.cpp
   unit/test_replay_window.cpp
   unit/test_ct.cpp
   unit/test_config.cpp
