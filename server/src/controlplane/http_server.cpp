@@ -427,6 +427,17 @@ Status HttpServer::serve() {
     return Status{ErrorCode::kInternal, "serve() called before listen()"};
   }
   health_.accepting_connections.store(true, std::memory_order_relaxed);
+
+  // Fixed worker pool: the accept loop never runs application code, so a slow
+  // or stalled client can only occupy its own worker.
+  const std::uint32_t worker_count =
+      options_.max_concurrent_connections == 0 ? 1U : options_.max_concurrent_connections;
+  workers_.reserve(worker_count);
+  for (std::uint32_t i = 0; i < worker_count; ++i) {
+    workers_.emplace_back([this] { run_worker(); });
+  }
+  log::info("http worker pool started", "workers", std::to_string(worker_count));
+
   const auto listener = static_cast<SocketHandle>(listen_fd_);
 
   while (!stopping_.load(std::memory_order_relaxed)) {
@@ -435,7 +446,7 @@ Status HttpServer::serve() {
     FD_SET(listener, &read_set);
     timeval wait{};
     wait.tv_sec = 0;
-    wait.tv_usec = 200000;  // 200 ms so the stop flag is honoured promptly
+    wait.tv_usec = 100000;  // 100 ms so the stop flag is honoured promptly
 
     const int ready = ::select(static_cast<int>(listener) + 1, &read_set, nullptr, nullptr, &wait);
     if (ready == 0) continue;
@@ -454,8 +465,7 @@ Status HttpServer::serve() {
 
     sockaddr_storage peer{};
     SockLen peer_len = static_cast<SockLen>(sizeof(peer));
-    const SocketHandle client =
-        ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_len);
+    const SocketHandle client = ::accept(listener, reinterpret_cast<sockaddr*>(&peer), &peer_len);
     if (socket_failed(client)) {
       if (stopping_.load(std::memory_order_relaxed)) break;
       // EMFILE/ENFILE leave the listener readable, so an immediate retry would
@@ -463,14 +473,70 @@ Status HttpServer::serve() {
       std::this_thread::sleep_for(std::chrono::milliseconds(20));
       continue;
     }
-    active_client_.store(static_cast<std::intptr_t>(client), std::memory_order_relaxed);
-    handle_connection(static_cast<std::intptr_t>(client));
-    active_client_.store(-1, std::memory_order_relaxed);
-    close_socket(client);
+
+    bool accepted = false;
+    {
+      const std::lock_guard<std::mutex> lock(queue_mutex_);
+      // Bounded queue: past 4x the pool size we shed load instead of growing
+      // without limit (a plain SYN flood must not become an OOM).
+      if (queue_.size() < static_cast<std::size_t>(worker_count) * 4U) {
+        queue_.push_back(PendingConnection{static_cast<std::intptr_t>(client)});
+        active_connections_.fetch_add(1, std::memory_order_relaxed);
+        accepted = true;
+      }
+    }
+    if (!accepted) {
+      static constexpr char kBusy[] =
+          "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nRetry-After: 1\r\n"
+          "Connection: close\r\n\r\n";
+      (void)::send(client, kBusy, static_cast<IoSize>(sizeof(kBusy) - 1), 0);
+      close_socket(client);
+      health_.requests_rejected.fetch_add(1, std::memory_order_relaxed);
+      metrics_.inc_counter("vpn_http_requests_shed_total");
+      continue;
+    }
+    queue_cv_.notify_one();
   }
+
+  // Stop and join the pool. Workers finish their current request first, and any
+  // connection still queued is closed by its worker on the way out.
+  {
+    const std::lock_guard<std::mutex> lock(queue_mutex_);
+    pool_stop_ = true;
+  }
+  queue_cv_.notify_all();
+  for (auto& worker : workers_) {
+    if (worker.joinable()) worker.join();
+  }
+  workers_.clear();
 
   health_.accepting_connections.store(false, std::memory_order_relaxed);
   return Status{};
+}
+
+void HttpServer::run_worker() noexcept {
+  for (;;) {
+    PendingConnection conn{};
+    {
+      std::unique_lock<std::mutex> lock(queue_mutex_);
+      queue_cv_.wait(lock, [this] { return pool_stop_ || !queue_.empty(); });
+      if (queue_.empty()) {
+        if (pool_stop_) return;
+        continue;
+      }
+      conn = queue_.front();
+      queue_.pop_front();
+    }
+
+    const auto fd = static_cast<SocketHandle>(conn.fd);
+    // Best-effort tracking for shutdown: with a pool this is the most recently
+    // started request, which is enough to unblock a stuck recv() promptly.
+    active_client_.store(conn.fd, std::memory_order_relaxed);
+    handle_connection(conn.fd);
+    active_client_.store(-1, std::memory_order_relaxed);
+    close_socket(fd);
+    active_connections_.fetch_sub(1, std::memory_order_relaxed);
+  }
 }
 
 void HttpServer::handle_connection(std::intptr_t client_fd) {
@@ -660,16 +726,15 @@ std::string HttpServer::json_escape(std::string_view value) {
   return out;
 }
 
-HttpResponse HttpServer::route(const HttpRequest& request) {
+HttpResponse HttpServer::debug_route(const HttpRequest& request) {
   const auto problem = [](int status, const char* title) {
     HttpResponse r;
     r.status = status;
     r.content_type = "application/problem+json";
     r.body = std::string{"{\"type\":\"about:blank\",\"title\":\""} + title +
-             "\",\"status\":" + std::to_string(status) + "}";
+             "\",\"status\":" + std::to_string(status) + ",\"code\":\"not_found\"}";
     return r;
   };
-
   if (request.method != "GET" && request.method != "HEAD") {
     return problem(405, "Method Not Allowed");
   }
@@ -678,46 +743,112 @@ HttpResponse HttpServer::route(const HttpRequest& request) {
   const std::uint64_t now = unix_now();
   const std::uint64_t uptime = now > started ? now - started : 0;
 
-  if (request.path == "/healthz") {
+  if (request.path == "/debug/stats") {
     HttpResponse r;
-    r.body = std::string{"{\"status\":\"ok\",\"service\":\"vpnd\",\"version\":\"" VPN_VERSION
-                         "\",\"uptime_seconds\":"} +
-             std::to_string(uptime) + "}";
+    r.body = std::string{"{\"uptime_seconds\":"} + std::to_string(uptime) +
+             ",\"requests_total\":" +
+             std::to_string(health_.requests_total.load(std::memory_order_relaxed)) +
+             ",\"requests_rejected\":" +
+             std::to_string(health_.requests_rejected.load(std::memory_order_relaxed)) +
+             ",\"active_connections\":" + std::to_string(active_connections()) +
+             ",\"max_connections\":" + std::to_string(options_.max_concurrent_connections) +
+             ",\"config_generation\":" +
+             std::to_string(health_.config_generation.load(std::memory_order_relaxed)) +
+             ",\"listen\":\"" + json_escape(options_.bind.to_string()) + "\"" +
+             ",\"metrics_only\":" + (options_.metrics_only ? "true" : "false") + "}";
     return r;
   }
-
-  if (request.path == "/readyz") {
+  if (request.path == "/debug/version") {
     HttpResponse r;
-    const bool draining = health_.shutting_down.load(std::memory_order_relaxed);
-    const bool accepting = health_.accepting_connections.load(std::memory_order_relaxed);
-    if (draining) {
-      r.status = 503;
-      r.body = R"({"status":"draining","reason":"shutdown in progress"})";
-    } else if (!accepting) {
-      r.status = 503;
-      r.body = R"({"status":"starting","reason":"listener not ready"})";
-    } else {
-      r.body = std::string{"{\"status\":\"ready\",\"version\":\"" VPN_VERSION
-                           "\",\"uptime_seconds\":"} +
-               std::to_string(uptime) + ",\"checks\":{\"http\":\"ok\"}}";
-    }
+    r.body = std::string{"{\"service\":\""} + json_escape(options_.service_name) +
+             "\",\"version\":\"" VPN_VERSION "\",\"wire\":\"1\"}";
     return r;
   }
-
-  if (request.path == "/metrics") {
-    HttpResponse r;
-    r.content_type = "text/plain; version=0.0.4; charset=utf-8";
-    r.body = metrics_.render();
-    return r;
-  }
-
-  if (request.path == "/") {
-    HttpResponse r;
-    r.body = R"({"service":"vpnd","endpoints":["/healthz","/readyz","/metrics"]})";
-    return r;
-  }
-
   return problem(404, "Not Found");
+}
+
+HttpResponse HttpServer::route(const HttpRequest& request) {
+  const auto problem = [](int status, const char* title, const char* code) {
+    HttpResponse r;
+    r.status = status;
+    r.content_type = "application/problem+json";
+    r.body = std::string{"{\"type\":\"about:blank\",\"title\":\""} + title +
+             "\",\"status\":" + std::to_string(status) + ",\"code\":\"" + code + "\"}";
+    return r;
+  };
+
+  const bool is_builtin = request.path == "/healthz" || request.path == "/readyz" ||
+                          request.path == "/metrics" ||
+                          (!options_.metrics_only && request.path == "/");
+
+  if (is_builtin) {
+    if (request.method != "GET" && request.method != "HEAD") {
+      return problem(405, "Method Not Allowed", "method_not_allowed");
+    }
+    const std::uint64_t started = health_.started_at_unix.load(std::memory_order_relaxed);
+    const std::uint64_t now = unix_now();
+    const std::uint64_t uptime = now > started ? now - started : 0;
+
+    if (request.path == "/healthz") {
+      HttpResponse r;
+      r.body = std::string{"{\"status\":\"ok\",\"service\":\""} +
+               json_escape(options_.service_name) + "\",\"version\":\"" VPN_VERSION
+               "\",\"uptime_seconds\":" + std::to_string(uptime) + "}";
+      return r;
+    }
+
+    if (request.path == "/readyz") {
+      HttpResponse r;
+      const bool draining = health_.shutting_down.load(std::memory_order_relaxed);
+      const bool accepting = health_.accepting_connections.load(std::memory_order_relaxed);
+      if (draining) {
+        r.status = 503;
+        r.body = R"({"status":"draining","reason":"shutdown in progress"})";
+      } else if (!accepting) {
+        r.status = 503;
+        r.body = R"({"status":"starting","reason":"listener not ready"})";
+      } else {
+        r.body = std::string{"{\"status\":\"ready\",\"version\":\"" VPN_VERSION
+                             "\",\"uptime_seconds\":"} +
+                 std::to_string(uptime) + ",\"config_generation\":" +
+                 std::to_string(health_.config_generation.load(std::memory_order_relaxed)) +
+                 ",\"checks\":{\"http\":\"ok\"}}";
+      }
+      return r;
+    }
+
+    if (request.path == "/metrics") {
+      HttpResponse r;
+      r.content_type = "text/plain; version=0.0.4; charset=utf-8";
+      r.body = metrics_.render();
+      return r;
+    }
+
+    HttpResponse r;
+    r.body = std::string{"{\"service\":\""} + json_escape(options_.service_name) +
+             "\",\"endpoints\":[\"/healthz\",\"/readyz\",\"/metrics\"";
+    if (options_.dev_mode) r.body += ",\"/debug/stats\",\"/debug/version\"";
+    r.body += "]}";
+    return r;
+  }
+
+  // The metrics listener serves nothing else: it is meant to be scraped from a
+  // private network, and must never expose the API by accident.
+  if (options_.metrics_only) {
+    return problem(404, "Not Found", "not_found");
+  }
+
+  if (options_.dev_mode && request.path.rfind("/debug/", 0) == 0) {
+    return debug_route(request);
+  }
+
+  // REST API (mounted by main via set_router). Methods other than GET/HEAD are
+  // legitimate here, which is why the 405 check above is scoped to built-ins.
+  if (router_) {
+    return router_(request);
+  }
+
+  return problem(404, "Not Found", "not_found");
 }
 
 }  // namespace vpn::controlplane

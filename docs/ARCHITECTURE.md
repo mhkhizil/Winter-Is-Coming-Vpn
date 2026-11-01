@@ -119,13 +119,13 @@ Precise scope limits of the M0 process, so that nothing here overstates it:
 
 | Aspect | M0 reality |
 |---|---|
-| Listeners | **One** HTTP listener (`http.bind`, default `127.0.0.1:8080`). `metrics.bind` is parsed and validated but never bound — `/metrics`, `/healthz` and `/readyz` share the HTTP port. |
-| Ports 8443 / 9443 / 9100 from §4 | Not bound. They are the M3 target. |
-| Threads | Two: the accept loop plus one uptime-refresh thread. The accept loop is **single-threaded and handles each connection to completion**, so one slow client delays health responses for up to `http.request_timeout_secs` (default 10 s). That is the honest bound: the header block must arrive in full within that deadline or the connection is dropped (408), and `stop()`/SIGTERM abandons an in-flight request within ~100 ms. It still means **a handful of concurrent slow clients is enough to starve the endpoint**, so the M0 listener must stay behind a loopback or reverse-proxy boundary; it is not a public-internet posture. |
-| TLS | Not implemented. `tls.*` is parsed and `validate()` rejects production without cert/key paths, but **nothing terminates TLS** — a "production" config is accepted and served over plaintext. Do not put M0 in front of the internet. |
-| Auth | None. `admin_token` is parsed, redacted in `--print-config`, and never checked; no route consumes it. |
-| Config reload | None. No SIGHUP handler exists; `ExecReload` in any unit file is a no-op for the current binaries. |
-| `/debug/*` | Does not exist (`.env.example` claims `VPN_DEV_MODE` enables it — it does not). |
+| Listeners | **Two** HTTP listeners: `http.bind` (API/health/metrics) and `metrics.bind` (`metrics_only` mode, so scrape traffic has its own socket and can be firewalled separately). |
+| Ports 8443 / 9443 from §4 | Not bound. They are the TLS/API target. |
+| Threads | The accept loop only enqueues; a fixed worker pool (`http.max_connections`, default 64) serves requests, so a slow client occupies one worker instead of stalling health checks. The queue is bounded (4x the pool) and sheds load with 503 rather than growing. |
+| TLS | Not implemented. `tls.*` is parsed and `validate()` rejects production without cert/key paths, but **nothing terminates TLS** — put a proxy in front. |
+| Auth | None yet. `admin_token` is parsed, redacted, length-validated, and `HttpServer::set_router()` is the mount point for the API layer. |
+| Config reload | `SIGHUP` re-reads and validates the file: log level applies immediately, `vpn_config_reload_total` and `config_generation` are updated, and bind/limit changes are reported as needing a restart. |
+| `/debug/*` | `/debug/stats` and `/debug/version` exist when `dev_mode` is true. |
 | Readiness | Reflects only this process's own listener state (`accepting_connections`, `shutting_down`). There are no dependency checks because there are no dependencies. |
 | Known defects | **None open in the core.** The cookie port binding, the replay-window boundary and the inverted `ct::select()` were found by the verification pass and fixed; their assertions are now always on (`docs/PROTOCOL.md` §4). `docs/PROTOCOL.md` §2.1 keeps the cookie derivation as the normative rule. |
 

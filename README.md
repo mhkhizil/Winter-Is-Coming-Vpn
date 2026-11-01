@@ -44,18 +44,26 @@ suites green** (`vpn_unit_tests`, `vpn_http_tests`). Reproduce with
 
 ### What does not work today
 
-* No tunnel, no handshake, no X25519, no AEAD, no TLS — all arrive at M1.
-* `metrics.bind` / `--metrics-bind` is **parsed and ignored** (it now logs a
-  warning): metrics are served on `http.bind`, not on a second port. Do not point
-  scrape configs at `:9100`.
-* No config reload (there is no SIGHUP handler), no `/debug` endpoints, no
-  authentication: `admin_token` is parsed, redacted and length-validated, but no
-  route consumes it yet.
-* The HTTP listener is single-threaded: one slow client delays health responses up
-  to `http.request_timeout_secs`. It is a loopback/reverse-proxy deployment, not a
-  public-internet posture (`docs/ARCHITECTURE.md` §7).
-* No database, no Redis, no REST API. `docs/API.md` and `docs/DATA_MODEL.md`
-  describe M3 targets.
+* No tunnel, no handshake, no X25519 yet — `vpn::crypto` now has a verified
+  ChaCha20-Poly1305 (RFC 8439 KAT), HMAC-BLAKE2s + KDF1/2/3 (Python KATs) and a
+  BCrypt-backed CSPRNG; X25519 and Noise_IK are the next increment.
+* No TLS and no authentication on `vpnd`: `admin_token` is parsed, redacted and
+  length-validated, and the HTTP server exposes a `set_router()` hook, but no
+  `/api/v1` route exists yet.
+* No database, no Redis. `docs/API.md` and `docs/DATA_MODEL.md` remain the target.
+
+### Now implemented (previously listed as missing)
+
+* **`metrics.bind` is a real listener.** `/metrics`, `/healthz` and `/readyz` are
+  served on their own port and socket (`-Dmetrics_only` mode), so scrape traffic
+  never shares the API socket and `:9100` can be firewalled separately.
+* **The HTTP server is multi-threaded.** A fixed worker pool (`http.max_connections`,
+  default 64) serves connections; the accept loop only enqueues, so a slow client
+  occupies one worker instead of starving every request.
+* **`SIGHUP` reloads the config** (`vpn_config_reload_total`, `config_generation`
+  exposed on `/readyz`); bind/limit changes are reported as needing a restart
+  rather than silently ignored.
+* **`/debug/stats` and `/debug/version`** exist when `dev_mode` is on.
 
 ## Layout
 

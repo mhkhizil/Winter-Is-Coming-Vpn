@@ -10,7 +10,10 @@ add_library(vpn_core STATIC
   src/common/endpoint.cpp
   src/common/log.cpp
   src/crypto/blake2s.cpp
+  src/crypto/chacha20poly1305.cpp
   src/crypto/ct.cpp
+  src/crypto/kdf.cpp
+  src/crypto/random.cpp
   src/wire/message.cpp
   src/wire/replay_window.cpp
   src/config/config.cpp
@@ -19,6 +22,11 @@ add_library(vpn_core STATIC
 
 target_include_directories(vpn_core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(vpn_core PUBLIC cxx_std_20)
+
+# BCryptGenRandom is the CSPRNG behind vpn::crypto::fill_random on Windows.
+if(WIN32)
+  target_link_libraries(vpn_core PUBLIC bcrypt)
+endif()
 set_target_properties(vpn_core PROPERTIES
   CXX_VISIBILITY_PRESET hidden
   VISIBILITY_INLINES_HIDDEN ON)

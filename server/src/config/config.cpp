@@ -114,6 +114,8 @@ Result<ServerConfig> parse(std::string_view text) {
       cfg.http.bind = parsed;
     } else if (qualified == "http.request_timeout_secs") {
       if (!parse_u32(value, cfg.http.request_timeout_secs)) return fail("expected a number");
+    } else if (qualified == "http.max_connections") {
+      if (!parse_u32(value, cfg.http.max_connections)) return fail("expected a number");
     } else if (qualified == "http.max_header_bytes") {
       std::uint32_t v = 0;
       if (!parse_u32(value, v)) return fail("expected a number");
@@ -187,6 +189,9 @@ Status validate(const ServerConfig& cfg) {
   }
   if (cfg.http.request_timeout_secs == 0 || cfg.http.request_timeout_secs > 300) {
     return Status{ErrorCode::kInvalidArgument, "http.request_timeout_secs must be 1..300"};
+  }
+  if (cfg.http.max_connections < 1 || cfg.http.max_connections > 1024) {
+    return Status{ErrorCode::kInvalidArgument, "http.max_connections must be 1..1024"};
   }
   if ((!cfg.tls.cert_file.empty()) != (!cfg.tls.key_file.empty())) {
     return Status{ErrorCode::kInvalidArgument,

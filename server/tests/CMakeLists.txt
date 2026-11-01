@@ -5,11 +5,13 @@
 
 add_executable(vpn_unit_tests
   unit/test_main.cpp
+  unit/test_aead.cpp
   unit/test_blake2s.cpp
   unit/test_wire_message.cpp
   unit/test_replay_window.cpp
   unit/test_ct.cpp
   unit/test_config.cpp
+  unit/test_kdf.cpp
   unit/test_metrics.cpp)
 
 target_link_libraries(vpn_unit_tests PRIVATE vpn_core)

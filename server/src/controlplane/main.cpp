@@ -14,6 +14,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -32,11 +33,19 @@
 namespace {
 
 std::atomic<bool> g_stop_requested{false};
+std::atomic<bool> g_reload_requested{false};
 
 extern "C" void handle_signal(int /*sig*/) {
   // Async-signal-safe work only: set a flag, let the main loop unwind.
   g_stop_requested.store(true, std::memory_order_relaxed);
 }
+
+#if defined(SIGHUP)
+extern "C" void handle_sighup(int /*sig*/) {
+  // Reload request; the maintenance thread re-reads and validates the file.
+  g_reload_requested.store(true, std::memory_order_relaxed);
+}
+#endif
 
 constexpr int kExitOk = 0;
 constexpr int kExitUsage = 2;
@@ -194,57 +203,127 @@ int main(int argc, char** argv) {
   metrics.set_gauge("vpn_build_info", 1, {{"version", VPN_VERSION}, {"wire", "1"}});
 
   vpn::controlplane::HealthState health;
-  health.started_at_unix.store(static_cast<std::uint64_t>(std::time(nullptr)),
-                               std::memory_order_relaxed);
+  vpn::controlplane::HealthState metrics_health;
+  const auto started_unix = static_cast<std::uint64_t>(std::time(nullptr));
+  health.started_at_unix.store(started_unix, std::memory_order_relaxed);
+  metrics_health.started_at_unix.store(started_unix, std::memory_order_relaxed);
 
-  vpn::controlplane::HttpServer::Options options;
-  options.bind = cfg.http.bind;
-  options.request_timeout_secs = cfg.http.request_timeout_secs;
-  options.max_header_bytes = cfg.http.max_header_bytes;
+  vpn::controlplane::HttpServer::Options api_options;
+  api_options.bind = cfg.http.bind;
+  api_options.request_timeout_secs = cfg.http.request_timeout_secs;
+  api_options.max_header_bytes = cfg.http.max_header_bytes;
+  api_options.max_concurrent_connections = cfg.http.max_connections;
+  api_options.dev_mode = cfg.dev_mode;
+  api_options.service_name = "vpnd";
 
   // Install the handlers before the socket exists: a SIGTERM in the window
   // between listen() and serve() would otherwise take the default action.
   std::signal(SIGINT, handle_signal);
   std::signal(SIGTERM, handle_signal);
+#if defined(SIGHUP)
+  std::signal(SIGHUP, handle_sighup);
+#endif
 #if defined(SIGPIPE)
   std::signal(SIGPIPE, SIG_IGN);  // a client that vanishes must not kill vpnd
 #endif
 
-  vpn::controlplane::HttpServer server{options, health, metrics};
-  if (const vpn::Status st = server.listen(); !st.ok()) {
+  auto server = std::make_unique<vpn::controlplane::HttpServer>(api_options, health, metrics);
+  if (const vpn::Status st = server->listen(); !st.ok()) {
     vpn::log::error("failed to listen", "error", st.to_string());
     return kExitRuntime;
   }
 
-  // metrics.bind is parsed and validated but not bound in M0: /metrics shares the
-  // HTTP port. Say so out loud, because an operator who firewalls 9100 and
-  // expects /metrics to be private there would otherwise be surprised.
-  if (cfg.metrics_bind.host != cfg.http.bind.host || cfg.metrics_bind.port != cfg.http.bind.port) {
-    vpn::log::warn("metrics.bind is ignored in M0: /metrics is served on http.bind",
-                   "metrics_bind", cfg.metrics_bind.to_string());
+  // Second listener: metrics on their own port. Scrape traffic never shares a
+  // socket with the API, and :9100 can be firewalled separately.
+  vpn::controlplane::HttpServer::Options metrics_options = api_options;
+  metrics_options.bind = cfg.metrics_bind;
+  metrics_options.metrics_only = true;
+  metrics_options.dev_mode = false;
+  metrics_options.service_name = "vpnd-metrics";
+  auto metrics_server =
+      std::make_unique<vpn::controlplane::HttpServer>(metrics_options, metrics_health, metrics);
+
+  bool metrics_listening = true;
+  if (const vpn::Status st = metrics_server->listen(); !st.ok()) {
+    vpn::log::error("failed to bind the metrics listener", "error", st.to_string());
+    metrics_listening = false;
+    if (cfg.environment == "production") {
+      return kExitRuntime;  // production must expose metrics; fail loudly
+    }
+    vpn::log::warn("continuing without a dedicated metrics listener (development only)");
   }
 
-  // Uptime gauge refresh loop; also proves the process shuts down cleanly and
-  // turns a SIGINT/SIGTERM into a prompt, graceful stop of the accept loop.
+  std::thread metrics_thread{[&] {
+    if (metrics_listening) (void)metrics_server->serve();
+  }};
+
+  // One maintenance thread: uptime gauge, shutdown propagation, SIGHUP reload.
   std::atomic<bool> refreshing{true};
   std::thread refresher{[&] {
     const auto start = std::chrono::steady_clock::now();
     while (refreshing.load(std::memory_order_relaxed)) {
       if (g_stop_requested.load(std::memory_order_relaxed)) {
-        server.stop();
+        server->stop();
+        metrics_server->stop();
+      }
+      if (g_reload_requested.exchange(false, std::memory_order_relaxed)) {
+        if (config_path.empty()) {
+          vpn::log::warn("SIGHUP ignored: no --config file to reload");
+        } else {
+          auto reloaded = vpn::config::load_file(config_path);
+          vpn::Status rejected{};
+          if (!reloaded) {
+            rejected = reloaded.error();
+          } else if (const vpn::Status st = vpn::config::apply_environment(*reloaded); !st.ok()) {
+            rejected = st;
+          } else {
+            rejected = vpn::config::validate(*reloaded);
+          }
+          if (!rejected.ok()) {
+            vpn::log::error("config reload rejected; keeping the running config", "error",
+                            rejected.to_string());
+            metrics.inc_counter("vpn_config_reload_total", {{"result", "error"}});
+          } else {
+            vpn::log::Level new_level = vpn::log::level();
+            if (vpn::log::parse_level(reloaded->log.level, new_level)) {
+              vpn::log::set_level(new_level);
+            }
+            // Sockets, worker counts and timeouts are captured at listen time.
+            // Say so instead of pretending they were applied.
+            const bool needs_restart =
+                reloaded->http.bind.port != cfg.http.bind.port ||
+                reloaded->metrics_bind.port != cfg.metrics_bind.port ||
+                reloaded->http.max_connections != cfg.http.max_connections ||
+                reloaded->http.request_timeout_secs != cfg.http.request_timeout_secs;
+            cfg = *reloaded;
+            const auto generation =
+                health.config_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+            metrics.inc_counter("vpn_config_reload_total", {{"result", "ok"}});
+            metrics.set_gauge("vpn_config_generation", static_cast<double>(generation));
+            vpn::log::info("config reloaded from SIGHUP", "generation",
+                           std::to_string(generation));
+            if (needs_restart) {
+              vpn::log::warn("bind/limit changes in the file need a restart to take effect");
+            }
+          }
+        }
       }
       const auto elapsed = std::chrono::steady_clock::now() - start;
       const auto secs = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
       metrics.set_gauge("vpn_uptime_seconds", static_cast<double>(secs));
+      metrics.set_gauge("vpn_http_active_connections",
+                        static_cast<double>(server->active_connections()));
       std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
   }};
 
   vpn::log::info("accepting connections", "bind", cfg.http.bind.to_string());
-  const vpn::Status serve_status = server.serve();
+  const vpn::Status serve_status = server->serve();
 
   refreshing.store(false, std::memory_order_relaxed);
   refresher.join();
+  metrics_server->stop();
+  if (metrics_thread.joinable()) metrics_thread.join();
 
   if (!serve_status.ok()) {
     vpn::log::error("server loop failed", "error", serve_status.to_string());

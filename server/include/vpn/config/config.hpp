@@ -37,6 +37,7 @@ struct LogConfig {
 struct HttpConfig {
   Endpoint bind{"127.0.0.1", 8080};
   std::uint32_t request_timeout_secs{10};
+  std::uint32_t max_connections{64};
   std::size_t max_header_bytes{8192};
 };
 
