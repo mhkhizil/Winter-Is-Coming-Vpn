@@ -319,7 +319,13 @@ class Tun {
       return false;
     }
     ifreq request{};
-    std::snprintf(request.ifr_name, sizeof(request.ifr_name), "%s", name.c_str());
+    // Copy explicitly instead of snprintf("%s"): GCC cannot prove the name fits
+    // into ifr_name (IFNAMSIZ bytes) and -Wformat-truncation is fatal here.
+    if (name.size() >= sizeof(request.ifr_name)) {
+      error = "tun name is longer than IFNAMSIZ-1";
+      return false;
+    }
+    std::memcpy(request.ifr_name, name.c_str(), name.size() + 1);
     request.ifr_flags = static_cast<short>(IFF_TUN | IFF_NO_PI);
     if (::ioctl(fd_, TUNSETIFF, &request) < 0) {
       error = "TUNSETIFF failed";

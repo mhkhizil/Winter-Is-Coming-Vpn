@@ -31,8 +31,9 @@ void append_escaped(std::string& out, std::string_view in) {
       case '\t': out += "\\t"; break;
       default:
         if (needs_escape(c)) {
+          // Masked to 8 bits so GCC can prove "%04x" writes at most 4 characters.
           char buf[8] = {};
-          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c) & 0xFFU);
           out += buf;
         } else {
           out.push_back(ch);
@@ -57,10 +58,20 @@ void append_timestamp(std::string& out) {
   gmtime_r(&t, &tm);
 #endif
 
-  char buf[40] = {};
-  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", tm.tm_year + 1900,
-                tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec,
-                static_cast<int>(ms));
+  // Bounded arguments: GCC's -Wformat-truncation otherwise assumes every int may be
+  // 11 characters wide ("-2147483648") and refuses a 40-byte buffer. The modulo
+  // keeps each field inside its real range, so the worst case is 23 bytes + NUL.
+  const int year = (tm.tm_year + 1900) % 10000;
+  const int month = (tm.tm_mon + 1) % 100;
+  const int day = tm.tm_mday % 100;
+  const int hour = tm.tm_hour % 100;
+  const int minute = tm.tm_min % 100;
+  const int second = tm.tm_sec % 100;
+  const int millis = static_cast<int>(ms) % 1000;
+
+  char buf[32] = {};
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ", year, month, day, hour,
+                minute, second, millis);
   out += buf;
 }
 

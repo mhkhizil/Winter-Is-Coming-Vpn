@@ -21,40 +21,41 @@ and telemetry.
 
 | Layer | Language | Status |
 |---|---|---|
-| Server — control plane (`vpnd`) | C++20 | **M0 built and tested** — serves `/healthz`, `/readyz`, `/metrics` (health/L2 only; no API) |
-| Server — wire protocol core (`vpn::wire`, `vpn::crypto`) | C++20 | **M0 built and tested** — BLAKE2s (RFC 7693 vectors), message codec, MAC1/MAC2/cookie derivation, replay window; 0 known defects |
-| Server — data plane (`vpn-dp`) | C++20 | M2 — designed, **not implemented** (no source files exist) |
-| Control-plane API (`/api/v1`) | — | M3 — spec only (`docs/api/openapi.yaml`), **not implemented** |
-| `vpnctl` operator CLI | — | M3 — interface only (`server/cli/README.md`), **not implemented** |
+| Server — tunnel (`vpn-dp`) | C++20 | **implemented** — Noise_IK handshake, transport session, replay window, peer table from config, TUN on Linux, `SIGHUP` reload |
+| Server — wire protocol core (`vpn::wire`, `vpn::crypto`) | C++20 | **implemented** — BLAKE2s, X25519, ChaCha20-Poly1305, KDF, codec, MAC1/MAC2/cookie, replay window; RFC vectors green |
+| Server — control plane (`vpnd`) | C++20 | **implemented** — REST `/api/v1`, file-backed store, worker pool, `/healthz` `/readyz` `/metrics` on separate ports, `SIGHUP`, `/debug` |
+| Control-plane API (`/api/v1`) | C++20 | **implemented** — auth, devices, peers, config issuance, node catalog (see `docs/API.md` §0.1) |
+| Official-client interop | — | **NOT verified** — run `scripts/interop-test.sh` on Linux |
+| TLS termination | — | not implemented — terminate at a proxy |
+| PostgreSQL adapter, gRPC CP→DP, billing, `vpnctl` | — | not implemented (next increments) |
 | Android client | Kotlin | Folder placeholder only (`android/`) |
 | iOS client | Swift | Folder placeholder only (`ios/`) |
 
 Build status: Release, `-Werror`, clang 21 (via zig 0.16) — **0 warnings, 2/2 test
-suites green** (`vpn_unit_tests`, `vpn_http_tests`). Reproduce with
-`pwsh -File scripts/build-local.ps1 -Jobs 1`.
+suites green** (`vpn_unit_tests` 104 assertions, `vpn_http_tests` 11), and all
+sources cross-compile clean for `x86_64-linux-gnu` with `-Werror`.
+Reproduce with `pwsh -File scripts/build-local.ps1 -Jobs 1`.
 
 ### What genuinely works today
 
-* `vpnd` starts, serves `/healthz`, `/readyz`, `/metrics` and `/` on **one**
-  HTTP listener, handles SIGINT/SIGTERM (≤15 ms measured) and exits 0.
-* `vpn_core` builds as a dependency-free static library; its unit suite runs
-  offline and is green.
-* BLAKE2s-256 matches RFC 7693 Appendix B vectors (keyed, streaming, 560-case
-  differential test against Python's `hashlib`), and every digest literal in the
-  tests was re-derived independently.
-* The wire codec round-trips all four message types, rejects malformed input
-  (wrong size, unknown type, non-16-multiple payload, exhausted counter), and
-  derives MAC1/MAC2/cookies to the documented byte ranges.
+* `vpn-dp` terminates a WireGuard handshake and carries encrypted transport
+  packets; peers are authenticated against the `[[peer]]` list in `datad.toml`.
+* `vpnd` serves `/healthz`, `/readyz`, `/metrics` (separate listener) and the whole
+  `/api/v1` surface, verified end to end: login → device → key → node → peer →
+  `wg-quick` config → delete → `401` without a token.
+* Crypto is validated against the specifications: BLAKE2s (RFC 7693), X25519
+  (RFC 7748 incl. the 1000-iteration vector and all small-order points),
+  ChaCha20-Poly1305 (RFC 8439 §2.8.2 byte-exact), KDF/HMAC against Python.
+* The wire codec round-trips all four message types, rejects malformed input, and
+  the transport path rejects replayed, tampered and foreign packets.
 
 ### What does not work today
 
-* No tunnel, no handshake, no X25519 yet — `vpn::crypto` now has a verified
-  ChaCha20-Poly1305 (RFC 8439 KAT), HMAC-BLAKE2s + KDF1/2/3 (Python KATs) and a
-  BCrypt-backed CSPRNG; X25519 and Noise_IK are the next increment.
-* No TLS and no authentication on `vpnd`: `admin_token` is parsed, redacted and
-  length-validated, and the HTTP server exposes a `set_router()` hook, but no
-  `/api/v1` route exists yet.
-* No database, no Redis. `docs/API.md` and `docs/DATA_MODEL.md` remain the target.
+* Interop with the official WireGuard client is **not yet executed** — the one gate
+  self-consistency cannot prove (`docs/INTEROP.md`).
+* No TLS in the binary: run `vpnd` behind nginx/caddy/LB (`docs/DEPLOYMENT.md`).
+* TUN forwarding is Linux-only; other platforms run handshake-only.
+* No PostgreSQL adapter, no gRPC CP→DP channel, no billing, no `vpnctl`.
 
 ### Now implemented (previously listed as missing)
 

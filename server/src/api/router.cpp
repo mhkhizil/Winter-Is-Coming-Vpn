@@ -26,8 +26,9 @@ std::string escape(const std::string& in) {
       case '\t': out += "\\t"; break;
       default:
         if (static_cast<unsigned char>(c) < 0x20U) {
+          // Masked to 8 bits: GCC then proves "%04x" cannot overflow this buffer.
           char buffer[8] = {};
-          std::snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned>(c));
+          std::snprintf(buffer, sizeof(buffer), "\\u%04x", static_cast<unsigned>(c) & 0xFFU);
           out += buffer;
         } else {
           out.push_back(c);

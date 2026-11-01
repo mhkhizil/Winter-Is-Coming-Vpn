@@ -755,8 +755,9 @@ std::string HttpServer::json_escape(std::string_view value) {
       case '\t': out += "\\t"; break;
       default:
         if (static_cast<unsigned char>(c) < 0x20U) {
+          // Masked to 8 bits: GCC then proves "%04x" cannot overflow this buffer.
           char buf[8] = {};
-          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+          std::snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c) & 0xFFU);
           out += buf;
         } else {
           out.push_back(c);
