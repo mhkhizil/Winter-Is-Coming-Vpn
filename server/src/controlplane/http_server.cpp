@@ -667,6 +667,43 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
   }
   request.path = std::move(target);
 
+  // Capture a bounded request body for the REST layer. Larger bodies are not
+  // read (the API never accepts them): the connection closes after the response.
+  constexpr std::size_t kMaxRequestBody = 8192;
+  const std::size_t body_offset = header_end + 4;
+  const std::size_t content_length =
+      declared_content_length(std::string_view{buffer}.substr(0, body_offset));
+  if (content_length > 0 && content_length <= kMaxRequestBody) {
+    while (buffer.size() < body_offset + content_length) {
+      const int got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
+      if (got <= 0) break;
+      buffer.append(chunk, static_cast<std::size_t>(got));
+    }
+    if (buffer.size() >= body_offset + content_length) {
+      request.body = buffer.substr(body_offset, content_length);
+    }
+  }
+
+  // Authorization header (raw value); the router parses the scheme.
+  {
+    const std::string header_block = buffer.substr(0, header_end);
+    std::string lower = header_block;
+    for (char& ch : lower) {
+      if (ch >= 'A' && ch <= 'Z') ch = static_cast<char>(ch - 'A' + 'a');
+    }
+    const std::string needle = "\r\nauthorization:";
+    const std::size_t at = lower.find(needle);
+    if (at != std::string::npos) {
+      std::size_t start = at + needle.size();
+      while (start < header_block.size() &&
+             (header_block[start] == ' ' || header_block[start] == '\t')) {
+        ++start;
+      }
+      std::size_t end = header_block.find("\r\n", start);
+      if (end == std::string::npos) end = header_block.size();
+      request.authorization = header_block.substr(start, end - start);
+    }
+  }
   const HttpResponse response = route(request);
   const bool is_head = request.method == "HEAD";
 
@@ -689,9 +726,10 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
   // Content-Length only tells us how many bytes to skip, and unknown/oversized
   // bodies fall back to a bounded drain.
   shutdown_send(fd);
-  const std::size_t body_offset = header_end + 4;
-  const std::size_t already_read = buffer.size() > body_offset ? buffer.size() - body_offset : 0;
-  const std::size_t declared = declared_content_length(std::string_view{buffer}.substr(0, body_offset));
+  const std::size_t drain_offset = header_end + 4;
+  const std::size_t already_read = buffer.size() > drain_offset ? buffer.size() - drain_offset : 0;
+  const std::size_t declared =
+      declared_content_length(std::string_view{buffer}.substr(0, drain_offset));
   std::size_t to_drain = 0;
   if (declared > already_read) {
     to_drain = declared - already_read;

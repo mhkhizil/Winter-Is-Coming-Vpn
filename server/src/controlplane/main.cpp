@@ -14,11 +14,14 @@
 #include <cstdint>
 #include <cstdio>
 #include <ctime>
+#include <cstdlib>
 #include <memory>
 #include <string>
 #include <string_view>
 #include <thread>
 
+#include "vpn/api/router.hpp"
+#include "vpn/api/store.hpp"
 #include "vpn/common/endpoint.hpp"
 #include "vpn/common/log.hpp"
 #include "vpn/common/result.hpp"
@@ -232,6 +235,35 @@ int main(int argc, char** argv) {
     vpn::log::error("failed to listen", "error", st.to_string());
     return kExitRuntime;
   }
+
+  // --- control-plane state and REST API -------------------------------------
+  // A file-backed store keeps the deployment to a single binary; the same
+  // interfaces are implemented by the PostgreSQL backend described in
+  // server/migrations/0001_init.sql.
+  vpn::api::StoreOptions store_options;
+  const char* store_path = std::getenv("VPN_STORE_PATH");
+  store_options.path = store_path == nullptr ? std::string{"vpn-control.log"} : store_path;
+  const char* endpoint_host = std::getenv("VPN_ENDPOINT_HOST");
+  store_options.endpoint_host =
+      endpoint_host == nullptr ? std::string{"127.0.0.1"} : endpoint_host;
+  const char* dns = std::getenv("VPN_DNS");
+  if (dns != nullptr) store_options.dns = dns;
+
+  auto store = vpn::api::Store::open(store_options);
+  if (!store) {
+    vpn::log::error("cannot open the control-plane store", "error",
+                    store.error().to_string());
+    return kExitRuntime;
+  }
+  vpn::api::RouterOptions router_options;
+  router_options.store = store->get();
+  router_options.token_ttl_seconds = 3600;
+  vpn::api::Router router{router_options};
+  server->set_router([&router](const vpn::controlplane::HttpRequest& request) {
+    return router.handle(request);
+  });
+  vpn::log::info("control-plane API mounted", "users",
+                 std::to_string(store->get()->user_count()));
 
   // Second listener: metrics on their own port. Scrape traffic never shares a
   // socket with the API, and :9100 can be firewalled separately.

@@ -7,6 +7,8 @@
 #   vpn-dp        : data-plane process (M2); must never link the control plane.
 
 add_library(vpn_core STATIC
+  src/api/router.cpp
+  src/api/store.cpp
   src/common/endpoint.cpp
   src/common/log.cpp
   src/crypto/blake2s.cpp

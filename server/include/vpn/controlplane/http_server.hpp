@@ -40,6 +40,8 @@ struct HttpRequest {
   std::string query{};     // without the leading '?'
   std::string client_ip{};
   std::string client_port{};  // as text, for rate limiting / logging
+  std::string body{};         // bounded request body (max 8 KiB), for the REST layer
+  std::string authorization{};  // raw Authorization header value, if present
 };
 
 struct HttpResponse {
