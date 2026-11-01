@@ -16,6 +16,7 @@ add_library(vpn_core STATIC
   src/crypto/ct.cpp
   src/crypto/kdf.cpp
   src/crypto/random.cpp
+  src/crypto/sha256.cpp
   src/crypto/x25519.cpp
   src/wire/message.cpp
   src/wire/noise.cpp

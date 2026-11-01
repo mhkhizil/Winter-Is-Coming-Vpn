@@ -25,7 +25,7 @@ and telemetry.
 | Server — wire protocol core (`vpn::wire`, `vpn::crypto`) | C++20 | **implemented** — BLAKE2s, X25519, ChaCha20-Poly1305, KDF, codec, MAC1/MAC2/cookie, replay window; RFC vectors green |
 | Server — control plane (`vpnd`) | C++20 | **implemented** — REST `/api/v1`, file-backed store, worker pool, `/healthz` `/readyz` `/metrics` on separate ports, `SIGHUP`, `/debug` |
 | Control-plane API (`/api/v1`) | C++20 | **implemented** — auth, devices, peers, config issuance, node catalog (see `docs/API.md` §0.1) |
-| Official-client interop | — | **NOT verified** — run `scripts/interop-test.sh` on Linux |
+| Interop | — | **independently verified**: an independent Python implementation completes handshake + transport (`scripts/interop-local.ps1`); official `wg-quick` run pending on Linux (`scripts/interop-test.sh`) |
 | TLS termination | — | not implemented — terminate at a proxy |
 | PostgreSQL adapter, gRPC CP→DP, billing, `vpnctl` | — | not implemented (next increments) |
 | Android client | Kotlin | Folder placeholder only (`android/`) |

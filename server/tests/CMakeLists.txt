@@ -11,6 +11,7 @@ add_executable(vpn_unit_tests
   unit/test_noise.cpp
   unit/test_x25519.cpp
   unit/test_replay_window.cpp
+  unit/test_sha256.cpp
   unit/test_ct.cpp
   unit/test_config.cpp
   unit/test_kdf.cpp

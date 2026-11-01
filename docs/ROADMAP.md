@@ -13,7 +13,8 @@ tunnel). The one unproven link is interop with the *official* WireGuard client: 
 | `vpn-dp` (UDP, peers, TUN, SIGHUP reload) | **done** | builds, binds, handshake path tested; TUN is Linux-only |
 | `vpnd` (health/ready/metrics, worker pool, SIGHUP, `/debug`) | **done** | live smoke test |
 | REST `/api/v1` + file-backed store | **done** | live end-to-end run (§ commit `f605cf3`) |
-| Official-client interop | **NOT verified** | run `scripts/interop-test.sh` |
+| Interop with an independent implementation | **verified** | `scripts/interop-local.ps1` -> handshake + transport PASS |
+| Interop with the official `wg-quick` client | **NOT verified** | run `scripts/interop-test.sh` on Linux |
 | TLS termination | **not implemented** | terminate at a proxy |
 | PostgreSQL adapter, gRPC CP→DP, billing | not implemented | next increments |
 

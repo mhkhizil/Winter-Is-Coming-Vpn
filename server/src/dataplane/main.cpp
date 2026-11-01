@@ -187,7 +187,10 @@ vpn::Result<Config> load_config(const std::string& path) {
                                  "public_key must be 64 hex characters");
         }
       } else if (key == "allowed_ips") {
+        // TOML array: ["10.66.0.1/32"] (or a bare comma-separated list).
         std::string list = value;
+        if (!list.empty() && list.front() == '[') list.erase(0, 1);
+        if (!list.empty() && list.back() == ']') list.pop_back();
         std::size_t start = 0;
         while (start <= list.size()) {
           const std::size_t comma = list.find(',', start);
@@ -485,6 +488,9 @@ int main(int argc, char** argv) {
               cfg.listen.c_str(),
               vpn::to_hex(vpn::as_span(cfg.public_key)).substr(0, 16).c_str(), peers.size(),
               tun.available() ? cfg.tun.c_str() : "disabled");
+  // Line-buffered output: an operator piping the log must see the banner now, not
+  // when the process happens to fill a buffer.
+  std::fflush(stdout);
 
   const vpn::crypto::X25519KeyPair server_keys{cfg.private_key, cfg.public_key};
   Statistics stats{};
@@ -571,6 +577,7 @@ int main(int argc, char** argv) {
                 ++stats.handshakes_ok;
                 std::printf("peer %s established (local index %u)\n",
                             owner->config.name.c_str(), owner->session.local_index());
+                std::fflush(stdout);
               }
             }
           } else {
@@ -587,6 +594,13 @@ int main(int argc, char** argv) {
             if (!opened) break;
             ++stats.transport_in;
             ++peer.rx_packets;
+            if (peer.rx_packets == 1) {
+              // Operational signal (no payload content): proves the transport keys
+              // agree end to end, which is what an interop test needs to assert.
+              std::printf("peer %s: first transport packet accepted (%zu bytes inner)\n",
+                          peer.config.name.c_str(), opened->size());
+              std::fflush(stdout);
+            }
             peer.endpoint = from;  // authenticated: safe to follow the peer
             peer.endpoint_len = static_cast<int>(from_len);
             if (!opened->empty() && tun.available()) (void)tun.write_packet(*opened);

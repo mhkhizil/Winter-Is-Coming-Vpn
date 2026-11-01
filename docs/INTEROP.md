@@ -48,15 +48,40 @@ Anything else prints the server log and `wg show` output.
 | Transport framing, counters and replay window are compatible | Interop with the *kernel* module on the client side |
 | Rekeying works (the client rekeys at 105 s; the script's keepalive forces traffic) | Behaviour under handshake floods |
 
-## Current status
+## Current status: independently verified, official client pending
 
-**Not yet executed on real hardware.** The sandbox this project was developed in has
-no Linux host, no `wireguard-tools` and no TUN device, so the claim remains
-"WireGuard®-compatible — target, not yet verified" (see `docs/PROTOCOL.md` §7).
+Two harnesses exist because two different things need proving:
 
-Run the script on any Linux box (a €4 VPS is enough) and record the output in
-`docs/perf/interop-<date>.md`. Until that file exists, no document in this
-repository may drop the "target, not verified" qualifier.
+| Harness | What it drives | Status |
+|---|---|---|
+| `scripts/interop-local.ps1` (Windows/CI, no TUN needed) | `scripts/interop_client.py` — a WireGuard implementation written from the spec **in Python, on a different crypto library** (`cryptography` for X25519/ChaCha20-Poly1305, `hashlib` for BLAKE2s) | **PASS** — see below |
+| `scripts/interop-test.sh` (Linux, root) | the **official** `wg-quick` client | not yet run (needs a Linux host with `wireguard-tools`) |
+
+Measured result of the independent harness:
+
+```
+client: handshake ok: local index 1847455516, remote index 2881985962
+client: transport sent: 4 packets
+server: peer interop-client established (local index 2881985962)
+server: peer interop-client: first transport packet accepted (32 bytes inner)
+PASS: independent implementation handshake + transport against vpn-dp
+```
+
+What that proves: our Noise_IK transcript, mac1 derivation, key schedule
+(`KDF1/2/3`, the `tau` step) and transport AEAD agree with an implementation that
+shares no code with ours. **That is the class of bug self-consistency cannot catch
+— and it caught two real ones:**
+
+1. `datad.toml` parsing never handled TOML arrays, so `allowed_ips = ["…/32"]`
+   was rejected: the shipped sample config could not start the server at all.
+2. The transport path requires the inner payload to be a 16-byte multiple
+   (WireGuard pads); a 20-byte test packet was correctly dropped by the server.
+
+What it does **not** prove: that our bytes are accepted by the *official* client
+build (the Python implementation is independent of us, but it is still one
+implementation). Run `sudo ./scripts/interop-test.sh` on any Linux box to close
+that, and record the output in `docs/perf/interop-<date>.md`. Until then, docs say
+"independently verified" rather than "compatible with the official client".
 
 ## If it fails
 
