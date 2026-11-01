@@ -38,11 +38,13 @@ namespace {
 using SocketHandle = SOCKET;
 using SockLen = int;
 using IoSize = int;
+using IoResult = int;
 constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else
 using SocketHandle = int;
 using SockLen = ::socklen_t;
 using IoSize = std::size_t;
+using IoResult = ssize_t;
 constexpr SocketHandle kInvalidSocket = -1;
 #endif
 
@@ -588,7 +590,7 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
       continue;
     }
 
-    const int got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
+    const IoResult got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
     if (got == 0) {
       // Peer closed. Count it only when it abandoned a request in flight.
       if (!buffer.empty()) health_.requests_rejected.fetch_add(1, std::memory_order_relaxed);
@@ -675,7 +677,7 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
       declared_content_length(std::string_view{buffer}.substr(0, body_offset));
   if (content_length > 0 && content_length <= kMaxRequestBody) {
     while (buffer.size() < body_offset + content_length) {
-      const int got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
+      const IoResult got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
       if (got <= 0) break;
       buffer.append(chunk, static_cast<std::size_t>(got));
     }

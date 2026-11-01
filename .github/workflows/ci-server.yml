@@ -38,9 +38,24 @@ jobs:
       - name: Install toolchain
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            gcc-13 g++-13 clang-18 ninja-build cmake clang-format-18
+          # Install only what this matrix entry needs: a missing optional package
+          # used to fail the whole job before it compiled anything.
+          sudo apt-get install -y --no-install-recommends ninja-build cmake
+          if [ "${{ matrix.preset }}" = "debug" ]; then
+            sudo apt-get install -y --no-install-recommends clang-18 clang-format-18
+          else
+            sudo apt-get install -y --no-install-recommends gcc-13 g++-13
+          fi
           cmake --version
+          ${{ matrix.cxx }} --version | head -n 1
+
+      - name: Work around the known ASan/ASLR failure on ubuntu-24.04 runners
+        if: matrix.preset == 'debug'
+        run: |
+          # Ubuntu 24.04 ships vm.mmap_rnd_bits=32; ASan cannot map its shadow at
+          # that entropy and aborts with "CHECK failed: sanitizer_allocator". This is
+          # an environment problem, not a defect in the code under test.
+          sudo sysctl -w vm.mmap_rnd_bits=28
 
       - name: Configure
         run: cmake --preset ${{ matrix.preset }}
@@ -70,7 +85,9 @@ jobs:
         run: |
           # wireguard-tools / wireguard.ko are GPL-2.0. They may be *invoked* in
           # tests, never vendored. See NOTICE and third_party/wg-test-vectors.
-          if grep -rIl --exclude-dir=.git --exclude=NOTICE --exclude=README.md \
+          # NOTE: this workflow file itself contains the pattern below, so .github is\
+          # excluded; otherwise the gate matches itself and fails every run.\
+          if grep -rIl --exclude-dir=.git --exclude-dir=.github --exclude=NOTICE --exclude=README.md \
             -e 'SPDX-License-Identifier: GPL' . ; then
             echo "::error::GPL-licensed file found in the repository"; exit 1
           fi

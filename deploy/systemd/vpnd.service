@@ -43,7 +43,10 @@ Restart=always
 RestartSec=2s
 TimeoutStartSec=15s
 TimeoutStopSec=20s
-# No ExecReload: vpnd has no reload path. See the note above.
+# Reload: vpnd re-reads its config file on SIGHUP (log level applies immediately;
+# bind/limit changes are logged as needing a restart). This is a real reload path,
+# not a no-op: see server/src/controlplane/main.cpp.
+ExecReload=/bin/kill -HUP $MAINPID
 
 User=vpn
 Group=vpn

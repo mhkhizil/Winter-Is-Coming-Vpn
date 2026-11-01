@@ -226,9 +226,13 @@ vpn::Result<Config> load_config(const std::string& path) {
 #if defined(_WIN32)
 using Socket = SOCKET;
 constexpr Socket kInvalidSocket = INVALID_SOCKET;
+using SendSize = int;
 #else
 using Socket = int;
 constexpr Socket kInvalidSocket = -1;
+// Winsock takes int lengths, POSIX takes size_t: one alias keeps -Wsign-conversion
+// quiet on both platforms without scattering casts.
+using SendSize = std::size_t;
 #endif
 
 struct UdpSocket {
@@ -530,7 +534,7 @@ int main(int argc, char** argv) {
       socklen_t from_len = sizeof(from);
       const int received =
           ::recvfrom(socket.fd, reinterpret_cast<char*>(datagram),
-                     static_cast<int>(sizeof(datagram)), 0, reinterpret_cast<sockaddr*>(&from),
+                     static_cast<SendSize>(sizeof(datagram)), 0, reinterpret_cast<sockaddr*>(&from),
                      &from_len);
       if (received > 0) {
         const ByteSpan packet{datagram, static_cast<std::size_t>(received)};
@@ -552,7 +556,7 @@ int main(int argc, char** argv) {
             Byte response[128];
             if (responder->create_response(MutableByteSpan{response, sizeof(response)})) {
               (void)::sendto(socket.fd, reinterpret_cast<const char*>(response),
-                             static_cast<int>(vpn::wire::kHandshakeResponseSize), 0,
+                             static_cast<SendSize>(vpn::wire::kHandshakeResponseSize), 0,
                              reinterpret_cast<const sockaddr*>(&from), from_len);
               if (owner->session.init(responder->keys()).ok()) {
                 owner->endpoint = from;
@@ -607,7 +611,7 @@ int main(int argc, char** argv) {
               MutableByteSpan{out, sizeof(out)}, ByteSpan{inner, static_cast<std::size_t>(length)});
           if (sealed > 0) {
             (void)::sendto(socket.fd, reinterpret_cast<const char*>(out),
-                           static_cast<int>(sealed), 0,
+                           static_cast<SendSize>(sealed), 0,
                            reinterpret_cast<const sockaddr*>(&peer.endpoint),
                            static_cast<socklen_t>(peer.endpoint_len));
             ++stats.transport_out;

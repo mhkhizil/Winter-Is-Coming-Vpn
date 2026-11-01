@@ -30,11 +30,18 @@ RUN cmake -S . -B build -G Ninja \
  && ctest --test-dir build --output-on-failure \
  && strip build/server/vpnd
 
+# vpnd keeps its control-plane state in a file; the distroless runtime has no
+# shell, so the directory is created and chowned here and copied in.
+RUN mkdir -p /var/lib/vpn && chown 65532:65532 /var/lib/vpn
+
 # --- runtime -----------------------------------------------------------------
 FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
 
 COPY --from=builder /src/build/server/vpnd /usr/local/bin/vpnd
+COPY --from=builder --chown=65532:65532 /var/lib/vpn /var/lib/vpn
 
+ENV VPN_STORE_PATH=/var/lib/vpn/control.log
+WORKDIR /var/lib/vpn
 USER 65532:65532
 EXPOSE 8080 9100
 ENTRYPOINT ["/usr/local/bin/vpnd"]

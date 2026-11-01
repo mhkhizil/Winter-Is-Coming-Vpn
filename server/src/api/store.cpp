@@ -17,6 +17,11 @@
 #include "vpn/crypto/kdf.hpp"
 #include "vpn/crypto/random.hpp"
 
+// Fallback so this file also builds outside CMake (which passes -DVPN_VERSION).
+#ifndef VPN_VERSION
+#define VPN_VERSION "0.0.0"
+#endif
+
 namespace vpn::api {
 namespace {
 

@@ -54,6 +54,11 @@ else()
   # "$<0:-O0" and "-g3>", which every compiler rejects (and which silently
   # removed the debug flags in Debug builds).
   add_compile_options($<$<CONFIG:Debug>:-O0> $<$<CONFIG:Debug>:-g3>)
+  # GCC-only false positives at -O2 with std::array/std::unique_ptr; clang does not
+  # have this warning at all. Everything else stays fatal.
+  if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-Wno-maybe-uninitialized)
+  endif()
 endif()
 
 if(VPN_WARNINGS_AS_ERRORS)
