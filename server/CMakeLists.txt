@@ -53,9 +53,17 @@ if(VPN_BUILD_CONTROLPLANE)
 endif()
 
 if(VPN_BUILD_DATAPLANE)
-  message(FATAL_ERROR
-    "VPN_BUILD_DATAPLANE is not implemented yet: the data plane lands in M2 "
-    "(docs/ROADMAP.md). Keep it OFF; vpnd and vpn_core are the M0 deliverables.")
+  add_executable(vpn-dp src/dataplane/main.cpp)
+  target_link_libraries(vpn-dp PRIVATE vpn_core)
+  if(WIN32)
+    target_link_libraries(vpn-dp PRIVATE ws2_32)
+  else()
+    find_package(Threads REQUIRED)
+    target_link_libraries(vpn-dp PRIVATE Threads::Threads)
+    if(UNIX AND NOT APPLE)
+      target_link_options(vpn-dp PRIVATE -Wl,-z,relro,-z,now)
+    endif()
+  endif()
 endif()
 
 if(VPN_BUILD_TESTS)

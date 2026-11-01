@@ -1,0 +1,31 @@
+# vpn-dp - data plane configuration (static, file based).
+#
+# This is the "no database needed" deployment: one server key, a list of peers
+# with their static public keys and the inner addresses they own.
+#
+#   vpn-dp --config /etc/vpn/datad.toml
+#
+# Generate the server key pair once:
+#   vpn-dp --genkey      (prints private+public; put the private key here)
+
+[interface]
+# base64 of the 32-byte Curve25519 private key (clamped on use)
+private_key = ""
+# address family + port to bind. 0.0.0.0:51820 is the WireGuard default.
+listen = "0.0.0.0:51820"
+# outer MTU for the UDP socket; inner TUN MTU is mtu - 80 at most.
+mtu = 1420
+# Linux TUN device name (created if missing). Empty or "none" disables the TUN,
+# which is only useful for handshake tests.
+tun = "wg0"
+# inner address of this server inside the tunnel (used for the TUN device)
+address = "10.66.0.1/24"
+
+# One [[peer]] block per device.
+[[peer]]
+name = "laptop"
+# base64 of the peer's 32-byte Curve25519 public key
+public_key = ""
+# inner addresses routed to this peer (CIDR). Traffic whose destination falls in
+# one of these prefixes is sent to this peer.
+allowed_ips = ["10.66.0.2/32"]
