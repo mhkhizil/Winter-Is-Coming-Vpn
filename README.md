@@ -1,12 +1,13 @@
 # vpn
 
-**Status: M0+M1 core done — the handshake and transport work; interop with the
-official WireGuard client is not yet verified on real hardware.**
-`vpn-dp` is a runnable, statically configured tunnel server: it terminates
-Noise_IK handshakes, authenticates peers from a config file, and encrypts /
-decrypts transport packets (Linux TUN; other platforms run in handshake-only
-mode). It is not yet a multi-tenant service: there is no API, no database and no
-TLS in front of `vpnd`. See [`docs/ROADMAP.md`](docs/ROADMAP.md).
+**Status: server side implemented — API, store, control plane and tunnel all
+build and run; interop with the official WireGuard client is the one gate not yet
+executed (run `scripts/interop-test.sh`).**
+`vpn-dp` is a runnable tunnel server (Noise_IK handshake, per-peer keys, TUN on
+Linux, SIGHUP reload); `vpnd` serves the REST control plane (`/api/v1`) backed by a
+file store, so no database is required. Not implemented: TLS termination (use a
+proxy), PostgreSQL adapter, billing. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+[`docs/INTEROP.md`](docs/INTEROP.md).
 
 The intended product is a multi-tenant VPN backend in modern C++: a userspace
 server that will terminate **WireGuard®-compatible** tunnels (so we keep control

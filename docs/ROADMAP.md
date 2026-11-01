@@ -1,7 +1,23 @@
 # Roadmap
 
-Status: **normative**. Each milestone is done only when its gate passes; nothing
-is "mostly done".
+Status: **M0 + M1 + M3-core implemented** (API → store → peers → client config →
+tunnel). The one unproven link is interop with the *official* WireGuard client: run
+`sudo ./scripts/interop-test.sh` on a Linux box (see [INTEROP.md](INTEROP.md)).
+
+## Implementation status (what exists today)
+
+| Component | State | Evidence |
+|---|---|---|
+| `vpn::crypto` (BLAKE2s, X25519, ChaCha20-Poly1305, KDF, CSPRNG) | **done** | RFC 7693 / 7748 / 8439 vectors + Python cross-checks |
+| `vpn::wire` (codec, mac1/mac2/cookie, replay window, Noise_IK, transport) | **done** | in-process handshake + 100-packet transport + replay tests |
+| `vpn-dp` (UDP, peers, TUN, SIGHUP reload) | **done** | builds, binds, handshake path tested; TUN is Linux-only |
+| `vpnd` (health/ready/metrics, worker pool, SIGHUP, `/debug`) | **done** | live smoke test |
+| REST `/api/v1` + file-backed store | **done** | live end-to-end run (§ commit `f605cf3`) |
+| Official-client interop | **NOT verified** | run `scripts/interop-test.sh` |
+| TLS termination | **not implemented** | terminate at a proxy |
+| PostgreSQL adapter, gRPC CP→DP, billing | not implemented | next increments |
+
+## Original milestone plan
 
 | M | Weeks | Scope | Blocking acceptance gate | State |
 |---|---|---|---|---|

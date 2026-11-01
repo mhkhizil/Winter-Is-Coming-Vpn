@@ -56,8 +56,14 @@ using vpn::Bytes;
 using vpn::MutableByteSpan;
 
 std::atomic<bool> g_stop{false};
+std::atomic<bool> g_reload{false};
 
 extern "C" void on_signal(int /*sig*/) { g_stop.store(true); }
+
+extern "C" void on_sighup(int /*sig*/) {
+  // systemctl reload vpn-datad: re-read the config file in the main loop.
+  g_reload.store(true);
+}
 
 // --- key decoding -----------------------------------------------------------
 // Keys are written as 64 hex characters. (WireGuard's base64 is a UI detail; the
@@ -451,6 +457,11 @@ int main(int argc, char** argv) {
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
+#if defined(SIGHUP)
+  // `systemctl reload vpn-datad` sends SIGHUP: re-read the config file and apply
+  // peer changes without dropping established tunnels.
+  std::signal(SIGHUP, on_sighup);
+#endif
 
   std::vector<Peer> peers;
   peers.reserve(cfg.peers.size());
@@ -485,6 +496,35 @@ int main(int argc, char** argv) {
     wait.tv_usec = 200000;
     const int ready = ::select(static_cast<int>(highest) + 1, &read_set, nullptr, nullptr, &wait);
     if (ready <= 0) continue;
+
+    if (g_reload.exchange(false)) {
+      auto reloaded = load_config(config_path);
+      if (!reloaded) {
+        std::fprintf(stderr, "warning: config reload failed: %s\n",
+                     reloaded.error().to_string().c_str());
+      } else {
+        // Apply peer changes in place: an established session survives a reload as
+        // long as its public key is still allowed, so a changed allowed_ips list
+        // never drops a working tunnel.
+        std::vector<Peer> updated;
+        updated.reserve(reloaded->peers.size());
+        for (const PeerConfig& pc : reloaded->peers) {
+          Peer peer;
+          peer.config = pc;
+          for (Peer& existing : peers) {
+            if (vpn::equals(vpn::as_span(existing.config.public_key),
+                            vpn::as_span(pc.public_key))) {
+              peer = existing;   // keeps the session, counters and endpoint
+              peer.config = pc;  // but takes the new name / allowed_ips
+              break;
+            }
+          }
+          updated.push_back(peer);
+        }
+        peers.swap(updated);
+        std::printf("configuration reloaded: %zu peer(s)\n", peers.size());
+      }
+    }
     if (FD_ISSET(socket.fd, &read_set)) {
       sockaddr_storage from{};
       socklen_t from_len = sizeof(from);

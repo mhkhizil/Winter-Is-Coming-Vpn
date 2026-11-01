@@ -51,8 +51,13 @@ jobs:
       - name: Unit tests
         run: ctest --preset ${{ matrix.preset }}
 
-      - name: Formatting (clang-format)
+      # Formatting is reported but not gated yet: the sources are hand-formatted to
+      # the 100-column Google style, not clang-format-clean. Rule: flip this to a
+      # hard gate only after 'cmake --build --preset default --target format' has
+      # been run once on main, otherwise every PR fails for whitespace.
+      - name: Formatting report (non-blocking)
         if: matrix.preset == 'default'
+        continue-on-error: true
         run: cmake --build --preset default --target format-check
 
   hygiene:

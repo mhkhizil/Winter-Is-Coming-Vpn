@@ -1,13 +1,43 @@
 # Control-plane API
 
-Status: **normative for M3+**. Nothing in this document is implemented; `vpnd`
-serves only `/healthz`, `/readyz`, `/metrics` and `/` today. Machine-readable
-spec: [`api/openapi.yaml`](api/openapi.yaml) (hand-written, spec-first). Clients
-will be generated from it; the intended server check is `oasdiff --breaking` in
-CI, which **does not exist yet** (no `oasdiff` step in `.github/workflows/`).
+Status: **partially implemented.** The endpoints marked ✅ in §0.1 are live in
+`vpnd` and were verified against the real binary; the rest are specified for the
+next increment. Machine-readable spec: [`api/openapi.yaml`](api/openapi.yaml).
 
-Base path `/api/v1`. Transport: HTTPS only (TLS 1.3 minimum). Auth:
-`Authorization: Bearer <access JWT>`.
+Base path `/api/v1`. Transport: **HTTPS terminated by a proxy** (this binary has no
+TLS library; see `docs/DEPLOYMENT.md`). Auth: `Authorization: Bearer <opaque token>`.
+
+## 0. Authentication carriers (implemented)
+
+The router accepts the token in three places, in this order:
+
+1. `Authorization: Bearer <token>` — standard, used by the mobile clients
+2. JSON body field `{"access_token":"..."}` — clients that cannot set headers
+3. query parameter `?token=<token>` — deep links
+
+Tokens are opaque 256-bit values stored as `HMAC-BLAKE2s-256(pepper, token)`, so a
+store leak cannot be replayed. TTL 3600 s (`RouterOptions::token_ttl_seconds`).
+
+## 0.1 Implemented endpoints ✅
+
+| Method | Path | Behaviour |
+|---|---|---|
+| POST | `/api/v1/auth/login` | `{email,password}` → `{access_token,token_type,expires_in,user_id}`; password hashes compared in constant time |
+| POST | `/api/v1/auth/logout` | revokes the presented token |
+| GET | `/api/v1/me` | `{user_id,tenant_id,role}` |
+| POST | `/api/v1/devices` | 201 `{id,name,platform}` |
+| GET | `/api/v1/devices` | caller's devices |
+| PUT | `/api/v1/devices/{id}/key` | 204; accepts **only** a 64-hex public key (ADR-0007) |
+| POST | `/api/v1/peers` | 201; allocates `10.66.0.N/32` + `fd00:66::N/128` |
+| GET | `/api/v1/peers` | list, including `revoked` tombstones |
+| GET | `/api/v1/peers/{id}` | single peer |
+| GET | `/api/v1/peers/{id}/config` | `text/plain` wg-quick file (base64 server key, no private key) |
+| DELETE | `/api/v1/peers/{id}` | 204; peer becomes `revoked` (tombstoned) |
+| GET | `/api/v1/servers` | node catalog |
+| POST | `/api/v1/nodes` | register a data-plane node (operator) |
+
+Rate limit: per-IP token bucket, 20 rps / burst 40 → `429 rate_limited`.
+Errors: RFC 9457 `application/problem+json` with a stable `code`.
 
 ## 1. Conventions
 

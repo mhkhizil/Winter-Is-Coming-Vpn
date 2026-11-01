@@ -15,7 +15,8 @@ Read in this order. Everything here is normative unless it says "draft".
 | 9 | [RUNBOOK.md](RUNBOOK.md) | On-call procedures: drain, rotate keys, restore, incident classes. |
 | 10 | [CAPACITY.md](CAPACITY.md) | Sizing table, cost model, measured-vs-modelled numbers. |
 | 11 | [BUILDING.md](BUILDING.md) | Toolchain bootstrap from a bare Windows 11 machine. |
-| 12 | [CPP_CONVENTIONS.md](CPP_CONVENTIONS.md) | C++ rules enforced by clang-tidy and review. |
+| 12 | [INTEROP.md](INTEROP.md) | The official-client interop gate and what it does/doesn't prove. |
+| 13 | [CPP_CONVENTIONS.md](CPP_CONVENTIONS.md) | C++ rules enforced by clang-tidy and review. |
 | 13 | [ROADMAP.md](ROADMAP.md) | M0–M6 with acceptance gates and what is *not* built yet. |
 | 14 | [CONTRIBUTING.md](../CONTRIBUTING.md) | Branch, commit, review and CI expectations. |
 | 15 | [SECURITY.md](../SECURITY.md) | Vulnerability disclosure policy. |

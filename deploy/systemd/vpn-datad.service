@@ -15,7 +15,7 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=notify
+Type=simple
 NotifyAccess=main
 ExecStart=/usr/bin/vpn-datad --config /etc/vpn/datad.toml
 ExecReload=/bin/kill -HUP $MAINPID
