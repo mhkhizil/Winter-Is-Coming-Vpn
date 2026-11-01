@@ -1,0 +1,43 @@
+# vpn-datad - data plane image (M2+).
+#
+# Static musl build on scratch: no shell, no libc package manager, no package
+# metadata to exploit. The container still needs NET_ADMIN + /dev/net/tun, so it
+# is run with host networking on an edge node (see ADR-0004).
+#
+# NOTE: `server/src/dataplane/` is empty until M2. This Dockerfile is here so the
+# deployment surface is reviewable now; it fails fast with a clear message instead
+# of producing a broken image.
+
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential g++-13 gcc-13 ninja-build cmake git ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /src
+COPY CMakeLists.txt CMakePresets.json ./
+COPY cmake ./cmake
+COPY server ./server
+
+# Guard: refuse to build an empty data plane.
+RUN test -f server/src/dataplane/main.cpp || \
+    (echo "server/src/dataplane/main.cpp is missing: the data plane lands in M2 (docs/ROADMAP.md)" >&2 && exit 1)
+
+RUN cmake -S . -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DVPN_BUILD_TESTS=OFF \
+      -DVPN_BUILD_CONTROLPLANE=OFF \
+      -DVPN_BUILD_DATAPLANE=ON \
+ && cmake --build build --target vpn-dp --parallel "$(nproc)" \
+ && strip build/server/vpn-dp
+
+FROM scratch AS runtime
+
+COPY --from=builder /src/build/server/vpn-dp /usr/local/bin/vpn-dp
+COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
+
+USER 65532:65532
+EXPOSE 51820/udp
+ENTRYPOINT ["/usr/local/bin/vpn-dp"]
+CMD ["--config", "/etc/vpn/datad.toml"]

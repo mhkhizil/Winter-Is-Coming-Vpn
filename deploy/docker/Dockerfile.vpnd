@@ -1,0 +1,54 @@
+# vpnd - control plane image.
+#
+# Two stages: a pinned Debian build image with just enough to compile, and a
+# distroless runtime with no shell, no package manager and a non-root user.
+# The M0 build needs no external dependencies at all, which is why this builds
+# offline in CI.
+
+ARG DEBIAN_VERSION=bookworm
+ARG CMAKE_VERSION=3.30.5
+
+# --- builder -----------------------------------------------------------------
+FROM debian:${DEBIAN_VERSION}-slim AS builder
+
+ARG CMAKE_VERSION
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      build-essential gcc g++ ninja-build curl ca-certificates xz-utils \
+ && rm -rf /var/lib/apt/lists/*
+
+RUN arch="$(dpkg --print-architecture)" \
+ && case "$arch" in \
+      amd64) cmake_arch="linux-x86_64" ;; \
+      arm64) cmake_arch="linux-aarch64" ;; \
+      *) echo "unsupported arch: $arch" >&2; exit 1 ;; \
+    esac \
+ && curl -fsSL -o /tmp/cmake.tar.gz \
+      "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-${cmake_arch}.tar.gz" \
+ && tar -xzf /tmp/cmake.tar.gz -C /opt \
+ && ln -s "/opt/cmake-${CMAKE_VERSION}-${cmake_arch}/bin/cmake" /usr/local/bin/cmake \
+ && ln -s "/opt/cmake-${CMAKE_VERSION}-${cmake_arch}/bin/ctest" /usr/local/bin/ctest \
+ && rm /tmp/cmake.tar.gz
+
+WORKDIR /src
+COPY CMakeLists.txt CMakePresets.json ./
+COPY cmake ./cmake
+COPY server ./server
+
+RUN cmake -S . -B build -G Ninja \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DVPN_WARNINGS_AS_ERRORS=ON \
+      -DVPN_BUILD_TESTS=ON \
+ && cmake --build build --parallel "$(nproc)" \
+ && ctest --test-dir build --output-on-failure \
+ && strip build/server/vpnd
+
+# --- runtime -----------------------------------------------------------------
+FROM gcr.io/distroless/cc-debian12:nonroot AS runtime
+
+COPY --from=builder /src/build/server/vpnd /usr/local/bin/vpnd
+
+USER 65532:65532
+EXPOSE 8080 9100
+ENTRYPOINT ["/usr/local/bin/vpnd"]
+CMD ["--bind", "0.0.0.0:8080", "--metrics-bind", "0.0.0.0:9100"]

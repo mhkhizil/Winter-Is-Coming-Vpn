@@ -1,0 +1,29 @@
+# vpnd - development configuration.
+# Mounted into the control container and used by `./vpnd --config`.
+# Every key here is validated at startup; unknown keys are a hard error.
+
+environment = "development"
+dev_mode = true
+
+[log]
+level = "debug"
+format = "json"
+
+[http]
+bind = "0.0.0.0:8080"
+request_timeout_secs = 10
+max_header_bytes = 8192
+
+[metrics]
+bind = "0.0.0.0:9100"
+
+# TLS is required in production and validated at startup; the dev stack
+# terminates TLS in front of vpnd instead.
+[tls]
+cert_file = ""
+key_file = ""
+client_ca_file = ""
+
+[rate_limit]
+requests_per_second = 100
+burst = 200

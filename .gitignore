@@ -1,0 +1,132 @@
+# --- build output ---------------------------------------------------------
+/build/
+/build-*/
+/out/
+/install/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+compile_commands.json
+.cache/
+.ccache/
+Testing/
+*.gcda
+*.gcno
+*.gcov
+coverage/
+perf.data*
+
+# --- generated / interpreter artifacts ------------------------------------
+# The golden-vector harness is Python; never commit bytecode or its scratch output.
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+server/tests/golden/work/
+
+# --- dependencies ---------------------------------------------------------
+/vcpkg/
+vcpkg_installed/
+/third_party/_deps/
+
+# --- binaries / packages --------------------------------------------------
+*.exe
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.pdb
+*.ilk
+*.deb
+*.rpm
+*.tar.gz
+*.zip
+# No exception for third_party/**: a committed archive is an unreviewable binary
+# blob (and a licensing blind spot). Test vectors are checked in as text.
+*.tgz
+
+# --- secrets / local env --------------------------------------------------
+.env
+.env.*
+!.env.example
+# Key and certificate material is NEVER committed. There is deliberately no
+# exception for docs/ : an allow-list of the form "!docs/**/*.pem" is exactly how
+# a real private key ends up in a public repository. If a doc needs to show a
+# key, use a redacted placeholder. Enforced by .github/workflows/docs-lint.yml.
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.p8
+*.der
+*.crt
+*.csr
+*.gpg
+*.asc
+id_rsa*
+id_dsa*
+id_ecdsa*
+id_ed25519*
+secrets/
+*.sealed.yaml
+!deploy/secrets/.gitkeep
+
+# --- local credentials / tooling state ------------------------------------
+.direnv/
+.envrc
+.netrc
+.pgpass
+my.cnf
+*.kubeconfig
+kubeconfig
+AWS_*
+
+# --- runtime state --------------------------------------------------------
+*.log
+*.pid
+*.sock
+/var/
+/tmp/
+
+# --- Kotlin / Android (future client) -------------------------------------
+.gradle/
+local.properties
+*.iml
+*.hprof
+.kotlin/
+android/.idea/
+android/build/
+android/app/build/
+android/local.properties
+
+# --- Swift / Xcode (future client) ----------------------------------------
+DerivedData/
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+ios/Pods/
+ios/build/
+.build/
+*.xcodeproj/xcuserdata/
+.swiftpm/
+
+# --- editors / OS ---------------------------------------------------------
+.vs/
+.vscode/
+!.vscode/extensions.json
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db
+desktop.ini

@@ -1,0 +1,515 @@
+openapi: 3.1.0
+info:
+  title: vpn control plane
+  version: 0.1.0
+  summary: Device enrollment, peer lifecycle, catalog, subscriptions and telemetry.
+  description: |
+    Hand-written, spec-first contract. Clients are generated from this document and
+    the server is reviewed against it (`oasdiff --breaking` in CI).
+
+    Errors use RFC 9457 (`application/problem+json`) and always carry a stable
+    `code` extension so clients never parse prose.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+servers:
+  - url: https://api.vpn.example
+    description: production
+  - url: http://127.0.0.1:8080
+    description: local development
+security:
+  - bearerAuth: []
+tags:
+  - name: auth
+  - name: devices
+  - name: peers
+  - name: catalog
+  - name: billing
+  - name: telemetry
+  - name: admin
+paths:
+  /healthz:
+    get:
+      summary: Liveness (no auth, never touches the database)
+      security: []
+      operationId: healthz
+      responses:
+        "200":
+          description: Process is alive
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Health" }
+  /readyz:
+    get:
+      summary: Readiness (503 while starting or draining)
+      security: []
+      operationId: readyz
+      responses:
+        "200": { description: Ready }
+        "503": { description: Not ready }
+  /metrics:
+    get:
+      summary: Prometheus exposition
+      security: []
+      operationId: metrics
+      responses:
+        "200":
+          description: Prometheus text format 0.0.4
+          content:
+            text/plain:
+              schema: { type: string }
+  /api/v1/auth/login:
+    post:
+      tags: [auth]
+      summary: Exchange credentials for an access + refresh token pair
+      security: []
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/LoginRequest" }
+      responses:
+        "200":
+          description: Token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Problem" }
+        "429": { $ref: "#/components/responses/Problem" }
+  /api/v1/auth/refresh:
+    post:
+      tags: [auth]
+      summary: Rotate the refresh token (reuse revokes the whole family)
+      security: []
+      operationId: refresh
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh_token]
+              properties:
+                refresh_token: { type: string }
+                device_id: { type: string }
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/TokenPair" }
+        "401": { $ref: "#/components/responses/Problem" }
+  /api/v1/devices:
+    post:
+      tags: [devices]
+      summary: Register a client install (attestation optional but recommended)
+      operationId: createDevice
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/DeviceCreate" }
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Device" }
+        "409": { $ref: "#/components/responses/Problem" }
+        "422": { $ref: "#/components/responses/Problem" }
+    get:
+      tags: [devices]
+      summary: List the caller's devices
+      operationId: listDevices
+      parameters:
+        - $ref: "#/components/parameters/Cursor"
+        - $ref: "#/components/parameters/Limit"
+      responses:
+        "200":
+          description: Page of devices
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/Device" }
+                  next_cursor: { type: [string, "null"] }
+  /api/v1/devices/{device_id}/key:
+    put:
+      tags: [devices]
+      summary: Upload the device's PUBLIC key (private keys never leave the device)
+      operationId: putDeviceKey
+      parameters:
+        - $ref: "#/components/parameters/DeviceId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [public_key]
+              properties:
+                public_key:
+                  type: string
+                  description: base64 of the 32-byte Curve25519 public key
+      responses:
+        "204": { description: Stored }
+        "422": { $ref: "#/components/responses/Problem" }
+  /api/v1/peers:
+    post:
+      tags: [peers]
+      summary: Create or reuse a peer and return its tunnel configuration
+      operationId: createPeer
+      parameters:
+        - $ref: "#/components/parameters/IdempotencyKey"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/PeerCreate" }
+      responses:
+        "201":
+          description: Peer created; body is the signed client config
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/PeerConfig" }
+        "409": { $ref: "#/components/responses/Problem" }
+        "503": { $ref: "#/components/responses/Problem" }
+  /api/v1/peers/{peer_id}:
+    get:
+      tags: [peers]
+      summary: Read a peer
+      operationId: getPeer
+      parameters:
+        - $ref: "#/components/parameters/PeerId"
+      responses:
+        "200":
+          description: Peer
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/Peer" }
+        "404": { $ref: "#/components/responses/Problem" }
+    delete:
+      tags: [peers]
+      summary: Revoke a peer (effective in <= 1 second)
+      operationId: deletePeer
+      parameters:
+        - $ref: "#/components/parameters/PeerId"
+      responses:
+        "204": { description: Revoked }
+        "404": { $ref: "#/components/responses/Problem" }
+  /api/v1/peers/{peer_id}/usage:
+    get:
+      tags: [peers]
+      summary: Bytes used and remaining quota
+      operationId: getPeerUsage
+      parameters:
+        - $ref: "#/components/parameters/PeerId"
+      responses:
+        "200":
+          description: Usage
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rx_bytes: { type: integer }
+                  tx_bytes: { type: integer }
+                  quota_bytes: { type: [integer, "null"] }
+                  window_start: { type: string, format: date-time }
+                  window_end: { type: string, format: date-time }
+  /api/v1/servers:
+    get:
+      tags: [catalog]
+      summary: List nodes with health and load hints
+      operationId: listServers
+      parameters:
+        - name: region
+          in: query
+          schema: { type: string }
+      responses:
+        "200":
+          description: Nodes
+          headers:
+            ETag: { schema: { type: string } }
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: "#/components/schemas/Server" }
+  /api/v1/telemetry/batches:
+    post:
+      tags: [telemetry]
+      summary: Upload batched, aggregate-only counters (idempotent by client uuid)
+      operationId: postTelemetryBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [batch_id, samples]
+              properties:
+                batch_id: { type: string, format: uuid }
+                samples:
+                  type: array
+                  maxItems: 500
+                  items:
+                    type: object
+                    required: [peer_id, ts, rx_bytes, tx_bytes]
+                    properties:
+                      peer_id: { type: string }
+                      ts: { type: string, format: date-time }
+                      rx_bytes: { type: integer }
+                      tx_bytes: { type: integer }
+                      session_secs: { type: integer }
+      responses:
+        "202": { description: Accepted (duplicates are ignored) }
+        "429": { $ref: "#/components/responses/Problem" }
+  /api/v1/webhooks/stripe:
+    post:
+      tags: [billing]
+      summary: Stripe webhook (signature-verified, idempotent by event id)
+      security: []
+      operationId: stripeWebhook
+      responses:
+        "202": { description: Accepted }
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: true
+      schema: { type: string, format: uuid }
+    Cursor:
+      name: cursor
+      in: query
+      schema: { type: string }
+    Limit:
+      name: limit
+      in: query
+      schema: { type: integer, minimum: 1, maximum: 200, default: 50 }
+    DeviceId:
+      name: device_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^dev_" }
+    PeerId:
+      name: peer_id
+      in: path
+      required: true
+      schema: { type: string, pattern: "^pe_" }
+  responses:
+    Problem:
+      description: RFC 9457 problem details
+      content:
+        application/problem+json:
+          schema: { $ref: "#/components/schemas/Problem" }
+  schemas:
+    Health:
+      type: object
+      required: [status, version, uptime_seconds]
+      properties:
+        status: { type: string, enum: [ok, ready, starting, draining] }
+        service: { type: string }
+        version: { type: string }
+        uptime_seconds: { type: integer, minimum: 0 }
+        checks:
+          type: object
+          additionalProperties: { type: string }
+    Problem:
+      type: object
+      required: [type, title, status]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code:
+          type: string
+          description: Stable machine-readable code
+          enum:
+            - unauthenticated
+            - token_expired
+            - device_revoked
+            - quota_exceeded
+            - node_at_capacity
+            - session_exists
+            - resume_expired
+            - config_unsupported
+            - rate_limited
+            - tenant_suspended
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email: { type: string, format: email }
+        password: { type: string, minLength: 12 }
+        totp: { type: string, pattern: "^[0-9]{6}$" }
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in, token_type]
+      properties:
+        access_token: { type: string }
+        refresh_token: { type: string }
+        expires_in: { type: integer, description: seconds, 600 by default }
+        token_type: { type: string, enum: [Bearer] }
+    DeviceCreate:
+      type: object
+      required: [platform, display_name]
+      properties:
+        platform: { type: string, enum: [android, ios, linux, macos, windows] }
+        display_name: { type: string, maxLength: 64 }
+        attestation:
+          type: object
+          properties:
+            provider: { type: string, enum: [play_integrity, app_attest, none] }
+            token: { type: string }
+    Device:
+      type: object
+      required: [id, platform, status]
+      properties:
+        id: { type: string, pattern: "^dev_" }
+        platform: { type: string }
+        status: { type: string, enum: [pending, active, revoked] }
+        display_name: { type: string }
+        public_key: { type: [string, "null"], description: base64, public only }
+        created_at: { type: string, format: date-time }
+    PeerCreate:
+      type: object
+      required: [device_id, public_key]
+      properties:
+        device_id: { type: string, pattern: "^dev_" }
+        public_key:
+          type: string
+          description: base64 Curve25519 public key generated on the device
+        region_preference: { type: string }
+        key_mode:
+          type: string
+          enum: [device, server]
+          default: device
+          description: |
+            `server` is legacy-import only: audited, rate-limited to 5/hour/device
+            and disabled for store builds (ADR-0007).
+    Peer:
+      type: object
+      required: [id, status, server_id, addresses]
+      properties:
+        id: { type: string, pattern: "^pe_" }
+        status: { type: string, enum: [active, suspended, revoked] }
+        server_id: { type: string }
+        addresses:
+          type: array
+          items: { type: string }
+        rx_bytes: { type: integer }
+        tx_bytes: { type: integer }
+        created_at: { type: string, format: date-time }
+    PeerConfig:
+      type: object
+      required: [peer_id, interface, peer, server_keys, signature]
+      properties:
+        peer_id: { type: string }
+        server:
+          type: object
+          properties:
+            id: { type: string }
+            endpoint: { type: string }
+            public_key: { type: string }
+            key_id: { type: string }
+        interface:
+          type: object
+          properties:
+            addresses: { type: array, items: { type: string } }
+            dns: { type: array, items: { type: string } }
+            mtu: { type: integer, default: 1420 }
+            private_key:
+              type: [string, "null"]
+              description: always null unless key_mode=server
+            listen_port: { type: integer, default: 0 }
+        peer:
+          type: object
+          properties:
+            public_key: { type: string }
+            preshared_key: { type: [string, "null"] }
+            persistent_keepalive_secs: { type: integer, default: 25 }
+            allowed_ips: { type: array, items: { type: string } }
+            excluded_ips: { type: array, items: { type: string } }
+        routing:
+          type: object
+          properties:
+            mode: { type: string, enum: [full_tunnel, split_tunnel] }
+            included_routes: { type: array, items: { type: string } }
+            excluded_routes: { type: array, items: { type: string } }
+            included_apps: { type: array, items: { type: string }, description: Android only }
+            excluded_apps: { type: array, items: { type: string }, description: Android only }
+            allow_lan: { type: boolean }
+            ipv6_mode: { type: string, enum: [dual, v4_only, v6_only] }
+        policy:
+          type: object
+          properties:
+            session_ttl_secs: { type: integer }
+            max_session_bytes: { type: [integer, "null"] }
+            bandwidth_kbps:
+              type: object
+              properties:
+                up: { type: integer }
+                down: { type: integer }
+            blocked_dest_ports: { type: array, items: { type: integer } }
+            dns_filter_profile: { type: string }
+            kill_switch: { type: boolean }
+        on_demand:
+          type: object
+          properties:
+            enabled: { type: boolean }
+            rules:
+              type: array
+              items:
+                type: object
+                properties:
+                  action: { type: string, enum: [connect, disconnect, evaluate] }
+                  interface_types: { type: array, items: { type: string } }
+                  ssid_match: { type: [string, "null"] }
+            trusted_ssids: { type: array, items: { type: string } }
+        server_keys:
+          type: array
+          items:
+            type: object
+            properties:
+              key_id: { type: string }
+              public_key: { type: string }
+              state: { type: string, enum: [primary, previous, retired] }
+              retire_at: { type: [string, "null"], format: date-time }
+        signature:
+          type: object
+          properties:
+            alg: { type: string, enum: [ed25519] }
+            key_id: { type: string }
+            value: { type: string }
+    Server:
+      type: object
+      required: [id, region, endpoint, load_hint]
+      properties:
+        id: { type: string, pattern: "^srv_" }
+        region: { type: string }
+        endpoint: { type: string }
+        public_key: { type: string }
+        status: { type: string, enum: [active, degraded, draining, disabled] }
+        load_hint:
+          type: number
+          minimum: 0
+          maximum: 1
+          description: 0 = idle, 1 = at capacity; clients prefer the lowest
+
+
+

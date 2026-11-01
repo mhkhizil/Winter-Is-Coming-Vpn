@@ -1,0 +1,101 @@
+# vpnd - VPN control plane (M0+).
+#
+# Hardening notes for operators (verify with `systemd-analyze security vpnd`):
+#   * vpnd needs NO capabilities and no devices: it owns one TCP listener and
+#     nothing else. Do not grant it CapabilityBoundingSet entries.
+#   * ReadWritePaths below covers only the state/log/runtime dirs created by
+#     StateDirectory/LogsDirectory/RuntimeDirectory. The M0 binary actually writes
+#     no files at all; keep the paths if you add persistence at M3, otherwise they
+#     are harmless empty directories.
+#   * vpnd does NOT implement sd_notify(3), so this unit must be Type=simple.
+#     Using Type=notify (as vpn-datad.service does) would hang startup until
+#     TimeoutStartSec and then kill a perfectly healthy process.
+#   * vpnd has NO SIGHUP handler and no config reload, so there is deliberately
+#     no ExecReload. `systemctl reload vpnd` would be a silent no-op. Restart to
+#     apply a config change, or add a reload handler first.
+#   * The M0 binary serves /healthz, /readyz and /metrics on http.bind (default
+#     127.0.0.1:8080). --metrics-bind and [metrics] bind are parsed and IGNORED;
+#     do not open 9100 in a firewall rule and expect a listener there.
+#
+# Before enabling this unit in anything but development:
+#   * M0 has no TLS and no authentication, and vpnd CANNOT bind a unix socket
+#     (only host:port). Keep it on 127.0.0.1 (the default) with a reverse proxy in
+#     front. Never bind 0.0.0.0 on a public host.
+#   * `/etc/vpn/vpnd.toml` is a placeholder path: create it, then confirm
+#     `vpnd --validate-config` passes as the unprivileged service user first.
+#     Because ReadOnlyPaths=/etc/vpn, the file must exist before start.
+
+[Unit]
+Description=vpn control plane (vpnd)
+# No Documentation= URL: the repo's docs are not published anywhere (every
+# other unit points at example.invalid, which can never resolve). Read
+# docs/DEPLOYMENT.md and docs/RUNBOOK.md from the source tree instead.
+After=network-online.target
+Wants=network-online.target
+# Restart forever: the control plane going down must not become a manual pager.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+NotifyAccess=none
+ExecStart=/usr/bin/vpnd --config /etc/vpn/vpnd.toml
+Restart=always
+RestartSec=2s
+TimeoutStartSec=15s
+TimeoutStopSec=20s
+# No ExecReload: vpnd has no reload path. See the note above.
+
+User=vpn
+Group=vpn
+StateDirectory=vpn
+StateDirectoryMode=0750
+LogsDirectory=vpn
+RuntimeDirectory=vpn
+RuntimeDirectoryMode=0750
+UMask=0027
+
+# --- privileges ---------------------------------------------------------------
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictSUIDSGID=yes
+
+# --- filesystem ---------------------------------------------------------------
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/etc/vpn
+ReadWritePaths=/run/vpn /var/lib/vpn /var/log/vpn
+InaccessiblePaths=/dev/shm
+
+# --- kernel surface -----------------------------------------------------------
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @mount @obsolete
+SystemCallErrorNumber=EPERM
+# TCP to clients, plus AF_UNIX/AF_NETLINK for name resolution and journald.
+# UDP is intentionally absent: M0 opens no UDP socket.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# --- resource limits ----------------------------------------------------------
+LimitNOFILE=65536
+# Hard cap so a leak or a runaway label set cannot take the host down.
+MemoryMax=1G
+TasksMax=64
+OOMPolicy=stop
+
+[Install]
+WantedBy=multi-user.target

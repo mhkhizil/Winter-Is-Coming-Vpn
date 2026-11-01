@@ -1,0 +1,110 @@
+# Local development stack for the vpn server.
+#
+#   docker compose -f deploy/compose/compose.yaml up --build -d
+#   docker compose -f deploy/compose/compose.yaml --profile dataplane up -d   # M2+
+#
+# The control plane (vpnd) is fully functional today. The data plane (datad)
+# arrives at M2 and therefore lives behind a profile so `make dev` never fails on
+# a not-yet-implemented service.
+
+name: vpn-dev
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: vpn
+      POSTGRES_PASSWORD: vpn
+      POSTGRES_DB: vpn
+      # Faster local startup; never copy these to production.
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ../../server/migrations:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vpn -d vpn"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:7.4-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "256mb"]
+    ports:
+      - "127.0.0.1:6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  control:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.vpnd
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      VPN_ENV: development
+      VPN_DEV_MODE: "true"
+      VPN_LOG_LEVEL: debug
+      VPN_HTTP_BIND: 0.0.0.0:8080
+      VPN_METRICS_BIND: 0.0.0.0:9100
+      VPN_DATABASE_URL: postgres://vpn:vpn@postgres:5432/vpn?sslmode=disable
+      VPN_REDIS_URL: redis://redis:6379/0
+    ports:
+      - "127.0.0.1:8080:8080"   # REST
+      - "127.0.0.1:9100:9100"   # /metrics /healthz /readyz
+    command: ["--config", "/etc/vpn/vpnd.toml"]
+    volumes:
+      - ./vpnd.dev.toml:/etc/vpn/vpnd.toml:ro
+    read_only: true
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: ["ALL"]
+
+  # --- M2+: the WireGuard data plane ----------------------------------------
+  datad:
+    profiles: ["dataplane"]
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile.datad
+    restart: unless-stopped
+    network_mode: host          # stable public UDP endpoint
+    cap_drop: ["ALL"]
+    cap_add: ["NET_ADMIN", "NET_RAW"]
+    devices:
+      - "/dev/net/tun:/dev/net/tun"
+    sysctls:
+      net.ipv4.ip_forward: "1"
+      net.ipv6.conf.all.forwarding: "1"
+      net.core.rmem_max: "26214400"
+      net.core.wmem_max: "26214400"
+      net.core.default_qdisc: "fq"
+      net.ipv4.conf.all.rp_filter: "2"
+    environment:
+      VPN_ENV: development
+      VPN_LOG_LEVEL: debug
+      VPN_DP_BIND: 0.0.0.0:51820
+      VPN_DP_TUN: wg-dev
+      VPN_DP_MTU: "1420"
+
+  # --- test harness only: a stock WireGuard client --------------------------
+  wgclient:
+    profiles: ["interop"]
+    image: linuxserver/wireguard:latest
+    cap_add: ["NET_ADMIN", "SYS_MODULE"]
+    sysctls:
+      net.ipv4.conf.all.src_valid_mark: "1"
+    volumes:
+      - ./wgclient:/config
+
+volumes:
+  pgdata:

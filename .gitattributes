@@ -1,0 +1,28 @@
+# Normalize everything to LF in the repository, regardless of the host OS.
+* text=auto eol=lf
+
+# Windows-only scripts must keep CRLF so cmd.exe/powershell parse them reliably.
+*.ps1  text eol=crlf
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.sln  text eol=crlf
+
+# Gradle wrapper must stay LF or it will not execute on Unix/macOS CI.
+gradlew      text eol=lf
+gradlew.bat  text eol=crlf
+
+# Binary fixtures: protocol test vectors, certificates, images.
+server/tests/vectors/**  -text
+third_party/wg-test-vectors/**  -text
+*.png  binary
+*.p12  binary
+*.der  binary
+
+# Keep diffs readable for generated-but-reviewed files.
+docs/api/openapi.yaml  text eol=lf
+server/migrations/*.sql  text eol=lf
+
+# Make GitHub render these as the languages they are.
+*.hpp  linguist-language=C++
+*.cpp  linguist-language=C++
+*.sql  linguist-language=SQL

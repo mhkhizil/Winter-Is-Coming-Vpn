@@ -1,0 +1,74 @@
+name: docs-lint
+
+# Claimed by docs/README.md rule 5. Enforces what the documents are allowed to
+# assert: links resolve, required docs exist, ADRs are well-formed, and no
+# marketing superlatives stand in for a measured property.
+on:
+  pull_request:
+    paths:
+      - "**/*.md"
+      - "docs/**"
+      - "scripts/check_docs.py"
+      - ".github/workflows/docs-lint.yml"
+  push:
+    branches: [main]
+    paths:
+      - "**/*.md"
+      - "docs/**"
+      - "scripts/check_docs.py"
+      - ".github/workflows/docs-lint.yml"
+
+concurrency:
+  group: docs-lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docs-lint:
+    name: links, required docs, ADR shape, forbidden terms
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Structure and link lint
+        run: python3 scripts/check_docs.py
+
+      - name: Forbidden marketing terms
+        run: |
+          # Rule: state the property, the mechanism and the residual risk.
+          # The canonical list is here; docs/README.md rule 5 points at it.
+          # NOTE: "production-ready"/"production-grade" are deliberately NOT in the
+          # list, so that honest negations ("this is not production-ready") stay
+          # writable. Only pure superlatives are banned.
+          terms='military.grade|unhackable|bulletproof|bank.level|enterprise.grade|battle.tested|100% secure|guaranteed secure'
+          if grep -rniE --include='*.md' --exclude-dir=.git "$terms" . ; then
+            echo "::error::forbidden marketing term found; state the measured property instead"
+            exit 1
+          fi
+          echo "OK: no forbidden terms"
+
+      - name: No committed key material
+        run: |
+          # docs/**/*.pem used to be allow-listed in .gitignore; that exception is
+          # gone, and this gate makes the intent explicit.
+          if git ls-files | grep -Ei '\.(pem|key|p12|pfx|jks|keystore|p8|der|crt)$' ; then
+            echo "::error::key/certificate material must never be committed"
+            exit 1
+          fi
+          # The character class is written so this workflow does not match itself.
+          if grep -rInE --exclude-dir=.git --include='*' -e 'BEGIN [A-Z ]*PRIVATE KEY' . ; then
+            echo "::error::private key block found in the repository"
+            exit 1
+          fi
+          echo "OK: no key material"
+
+      - name: systemd units referenced by docs exist
+        run: |
+          # docs/DEPLOYMENT.md and SECURITY.md name unit files; a renamed or
+          # missing unit is a documented command that cannot work.
+          for unit in vpnd vpn-datad; do
+            if [ ! -f "deploy/systemd/${unit}.service" ]; then
+              echo "::error::deploy/systemd/${unit}.service is missing but is referenced by docs"
+              exit 1
+            fi
+          done
+          echo "OK: systemd units present"

@@ -1,0 +1,42 @@
+{
+  "$comment": [
+    "M0 has ZERO external dependencies on purpose: a fresh clone must build and test",
+    "offline in under a minute so CI can gate every push. Dependencies arrive per",
+    "milestone, behind the features below, and are pinned by tools/deps.lock.",
+    "See docs/BUILDING.md and docs/DECISIONS/ADR-0005-crypto-library.md."
+  ],
+  "name": "vpn",
+  "version-semver": "0.1.0",
+  "description": "Multi-tenant, WireGuard-compatible VPN backend",
+  "homepage": "https://example.invalid/vpn",
+  "license": "Apache-2.0",
+  "builtin-baseline": "0000000000000000000000000000000000000000",
+  "dependencies": [],
+  "features": {
+    "crypto": {
+      "description": "Real cryptography: BoringSSL (X25519, ChaCha20-Poly1305, TLS 1.3, ML-KEM). Required from M1.",
+      "dependencies": ["boringssl"]
+    },
+    "logging": {
+      "description": "Structured, non-allocating logging. Required from M1.",
+      "dependencies": ["spdlog", "fmt"]
+    },
+    "api": {
+      "description": "Control-plane HTTP/2 + JSON + PostgreSQL. Required from M3.",
+      "dependencies": [
+        "drogon",
+        "nlohmann-json",
+        "libpqxx",
+        "openssl"
+      ]
+    },
+    "cli": {
+      "description": "vpnctl command-line parsing.",
+      "dependencies": ["cli11"]
+    },
+    "tests": {
+      "description": "GoogleTest + Google Benchmark for integration and performance suites.",
+      "dependencies": ["gtest", "benchmark"]
+    }
+  }
+}

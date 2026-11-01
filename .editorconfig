@@ -1,0 +1,35 @@
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+[*.{hpp,h,cpp,cc,cxx}]
+indent_size = 2
+max_line_length = 100
+
+[*.{json,yaml,yml}]
+indent_size = 2
+
+[*.{kt,kts}]
+indent_size = 4
+
+[*.swift]
+indent_size = 4
+
+[*.go]
+indent_style = tab
+
+[*.md]
+trim_trailing_whitespace = false
+max_line_length = 100
+
+[Makefile]
+indent_style = tab
+
+[*.{ps1,bat,cmd}]
+end_of_line = crlf

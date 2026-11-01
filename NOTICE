@@ -1,0 +1,42 @@
+vpn
+Copyright 2026 The vpn authors
+
+This product currently includes NO third-party source code. The dependency list below
+records the licences of components that later milestones will introduce; only the
+rows marked as shipping are actually linked into anything built from this tree
+today (none are). All planned third-party code is compatible with the Apache
+License 2.0.
+
+--------------------------------------------------------------------------------------------------
+TRADEMARK NOTICE
+--------------------------------------------------------------------------------------------------
+"WireGuard" and the "WireGuard" logo are registered trademarks of Jason A. Donenfeld.
+This project is an independent implementation that is *intended* to be wire-compatible with the
+WireGuard protocol. Wire compatibility has NOT yet been verified: it may only be claimed once the
+M1 interoperability gate in docs/PROTOCOL.md section 7 has passed. It is not endorsed by, sponsored
+by, or affiliated with the WireGuard project or its author. Any reference to WireGuard in this
+repository is a factual statement of protocol intent only.
+
+--------------------------------------------------------------------------------------------------
+PROTOCOL REFERENCES (specifications, not code)
+--------------------------------------------------------------------------------------------------
+* "WireGuard: Next Generation Kernel Network Tunnel" - Jason A. Donenfeld (protocol specification)
+* RFC 7693  - The BLAKE2 Cryptographic Hash and Message Authentication Code
+* RFC 7748  - Elliptic Curves for Security (X25519)
+* RFC 8439  - ChaCha20 and Poly1305 for IETF Protocols
+* RFC 6479  - IPsec Anti-Replay Algorithm without Bit Shifting
+No code is copied from the Linux kernel's GPL-2.0 `wireguard.ko` module, from `wireguard-tools`,
+or from any other GPL-licensed VPN implementation. Those tools are used only inside the test
+harness (as separate processes) to prove interoperability, which does not create a derivative work.
+
+--------------------------------------------------------------------------------------------------
+RUNTIME / BUILD DEPENDENCIES (per milestone; see docs/DECISIONS/ADR-0005-crypto-library.md)
+--------------------------------------------------------------------------------------------------
+BoringSSL              Apache-2.0   X25519, ChaCha20-Poly1305, TLS/DTLS, ML-KEM (M1+)
+nlohmann/json          MIT          control-plane JSON (M3+)
+Drogon                 MIT          control-plane HTTP/2 server (M3+)
+libpqxx / libpq        BSD-3 / PostgreSQL  database access (M3+)
+spdlog / fmt           MIT          structured logging (M1+)
+CLI11                  BSD-3        vpnctl argument parsing (M1+)
+googletest             BSD-3        integration test suites (M2+)
+Google Benchmark       Apache-2.0   micro-benchmarks (M2+)
