@@ -11,6 +11,14 @@
 // Linux is the production target (TUN + forwarding). On other platforms the TUN
 // code compiles to a stub that reports "unsupported", which still lets the
 // handshake and transport paths be exercised.
+//
+// recvmmsg()/mmsghdr are glibc extensions: they only exist when _GNU_SOURCE is
+// defined, and it has to be defined before the first libc header is pulled in,
+// hence above the include block.
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE
+#endif
+
 #include <atomic>
 #include <chrono>
 #include <csignal>
@@ -293,6 +301,16 @@ struct UdpSocket {
     const BOOL exclusive = TRUE;
     (void)::setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                        reinterpret_cast<const char*>(&exclusive), sizeof(exclusive));
+    // Non-blocking socket, select() does the waiting. Winsock has no per-call
+    // MSG_DONTWAIT, so this is how the batched receive path learns that the queue
+    // is empty (recvfrom -> WSAEWOULDBLOCK) after draining the datagrams that were
+    // already queued. A send that cannot be queued now reports WSAEWOULDBLOCK
+    // instead of blocking; for UDP that is the same packet loss it would suffer a
+    // moment later.
+    u_long nonblocking = 1;
+    // FIONBIO is an unsigned _IOW() constant while ioctlsocket() takes a long, so
+    // the cast is required to keep -Wsign-conversion quiet.
+    (void)::ioctlsocket(fd, static_cast<long>(FIONBIO), &nonblocking);
 #else
     const int reuse = 1;
     (void)::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
@@ -305,6 +323,93 @@ struct UdpSocket {
   }
 };
 
+
+// --- batched receive --------------------------------------------------------
+//
+// A wakeup used to cost two syscalls per datagram - select() plus a single
+// recvfrom() - and re-entered select() between every packet, so a socket that
+// already had a queue of work waiting was drained at one packet per syscall pair.
+// The helpers below hand the packet handler everything that is already queued:
+// one recvmmsg() fills a whole batch on Linux.
+//
+// The batch is bounded by kRxBatch so one busy peer cannot monopolise the loop.
+// After at most kRxBatch datagrams - or as soon as the socket would block - the
+// loop goes back to select(), which is also what keeps the TUN side serviced.
+constexpr std::size_t kRxBatch = 32;
+constexpr std::size_t kMaxDatagram = 65536;  // one full-size UDP payload
+
+// Receive buffers. kRxBatch * 64 KiB is far too much for a thread stack and the
+// hot path may not allocate, so the batch buffers live in static storage for the
+// life of the process; only the slots a batch actually fills are ever touched.
+alignas(64) Byte g_rx_buffers[kRxBatch][kMaxDatagram];
+
+#if defined(MSG_DONTWAIT)
+constexpr int kRxNoWait = MSG_DONTWAIT;
+#else
+// Winsock has no per-call "do not block" flag; UdpSocket::open() puts the socket
+// in non-blocking mode there instead, so a plain recvfrom() already returns as
+// soon as the queue is empty.
+constexpr int kRxNoWait = 0;
+#endif
+
+// One received datagram: who sent it and how many bytes it holds.
+struct RxSlot {
+  sockaddr_storage from{};
+  socklen_t from_len{0};
+  std::size_t size{0};  // 0 = nothing was received in this slot
+};
+
+// Reads up to `want` datagrams that are already queued on `fd`, into
+// g_rx_buffers[0..count) and slots[0..count). Returns how many were read.
+// Never blocks: the caller only gets here because select() reported the socket
+// readable, every later call is non-blocking, and a drain therefore stops at the
+// first empty queue instead of waiting for the next packet.
+std::size_t receive_batch(Socket fd, RxSlot* slots, std::size_t want) {
+  if (want > kRxBatch) want = kRxBatch;
+#if defined(__linux__)
+  mmsghdr messages[kRxBatch];
+  iovec vectors[kRxBatch];
+  for (std::size_t i = 0; i < want; ++i) {
+    slots[i] = RxSlot{};
+    vectors[i].iov_base = g_rx_buffers[i];
+    vectors[i].iov_len = kMaxDatagram;
+    messages[i].msg_hdr = msghdr{};
+    messages[i].msg_hdr.msg_name = &slots[i].from;
+    messages[i].msg_hdr.msg_namelen = static_cast<socklen_t>(sizeof(slots[i].from));
+    messages[i].msg_hdr.msg_iov = &vectors[i];
+    messages[i].msg_hdr.msg_iovlen = 1;
+    messages[i].msg_len = 0;
+  }
+  // One syscall for the whole batch. MSG_DONTWAIT makes it return what is queued
+  // right now instead of waiting for the batch to fill up.
+  const int received =
+      ::recvmmsg(fd, messages, static_cast<unsigned int>(want), kRxNoWait, nullptr);
+  if (received <= 0) return 0;  // EAGAIN/EWOULDBLOCK: the queue was empty after all
+  for (int i = 0; i < received; ++i) {
+    const std::size_t slot = static_cast<std::size_t>(i);
+    slots[slot].from_len = messages[slot].msg_hdr.msg_namelen;
+    slots[slot].size = messages[slot].msg_len;
+  }
+  return static_cast<std::size_t>(received);
+#else
+  std::size_t count = 0;
+  for (; count < want; ++count) {
+    slots[count] = RxSlot{};
+    socklen_t from_len = static_cast<socklen_t>(sizeof(slots[count].from));
+    // `recvfrom` returns ssize_t on POSIX and int on Windows; `auto` keeps both
+    // exact. Naming it `int` truncated the value and is a -Wshorten-64-to-32
+    // error on the Linux build.
+    const auto received =
+        ::recvfrom(fd, reinterpret_cast<char*>(g_rx_buffers[count]),
+                   static_cast<SendSize>(kMaxDatagram), kRxNoWait,
+                   reinterpret_cast<sockaddr*>(&slots[count].from), &from_len);
+    if (received <= 0) break;  // EWOULDBLOCK: the queue is empty again
+    slots[count].size = static_cast<std::size_t>(received);
+    slots[count].from_len = from_len;
+  }
+  return count;
+#endif
+}
 
 bool prefix_contains(const AllowedPrefix& prefix, std::uint32_t address) {
   const std::uint32_t mask =
@@ -712,10 +817,106 @@ int main(int argc, char** argv) {
 
   const vpn::crypto::X25519KeyPair server_keys{cfg.private_key, cfg.public_key};
   Statistics stats{};
-  Byte datagram[65536];
+  // Receive buffers for the socket live in g_rx_buffers (static, see the batched
+  // receive section); `inner` is the TUN-side packet buffer.
   Byte inner[65536];
   auto next_refresh =
       std::chrono::steady_clock::now() + std::chrono::seconds(refresh_secs > 0 ? refresh_secs : 3600);
+
+  // One datagram in, one datagram handled. This used to be inlined in the receive
+  // path; now that a wakeup can deliver a batch, the per-packet logic lives in one
+  // function so the batched drain and any single-datagram path cannot drift apart:
+  // the same counters, the same 'access expired' rejection, the same first-packet
+  // log, the same endpoint learning, the same O(1) session lookup.
+  // Returns true when the datagram was consumed as a handshake or transport packet
+  // - the two paths that used to `continue` the main loop.
+  const auto handle_datagram = [&](MutableByteSpan datagram, const sockaddr_storage& from,
+                                   socklen_t from_len) -> bool {
+    const ByteSpan packet{datagram.data(), datagram.size()};
+    const auto header = vpn::wire::decode(packet);
+
+    if (header && header->type == vpn::wire::MessageType::kHandshakeInitiation) {
+      auto responder = vpn::wire::NoiseIk::responder(server_keys);
+      vpn::crypto::X25519PublicKey learned{};
+      Peer* owner = nullptr;
+      if (responder && responder->consume_initiation(packet, learned)) {
+        for (Peer& peer : peers) {
+          if (vpn::equals(vpn::as_span(peer.config.public_key), vpn::as_span(learned))) {
+            owner = &peer;
+            break;
+          }
+        }
+      }
+      if (owner != nullptr) {
+        // Paid access lapses on the server side, not on the client's honour:
+        // an already-installed client gets its handshake refused, so the
+        // tunnel cannot outlive the subscription (ADR-0010).
+        if (owner->config.expires_at != 0 && owner->config.expires_at <= unix_now()) {
+          ++stats.handshakes_rejected;
+          std::printf("peer %s rejected: access expired\n", owner->config.name.c_str());
+          std::fflush(stdout);
+          return true;
+        }
+        Byte response[128];
+        if (responder->create_response(MutableByteSpan{response, sizeof(response)})) {
+          (void)::sendto(socket.fd, reinterpret_cast<const char*>(response),
+                         static_cast<SendSize>(vpn::wire::kHandshakeResponseSize), 0,
+                         reinterpret_cast<const sockaddr*>(&from), from_len);
+          if (owner->session.init(responder->keys()).ok()) {
+            owner->endpoint = from;
+            owner->endpoint_len = static_cast<int>(from_len);
+            owner->established = true;
+            rebuild_index();  // the new session index must be findable
+            ++stats.handshakes_ok;
+            std::printf("peer %s established (local index %u)\n",
+                        owner->config.name.c_str(), owner->session.local_index());
+            std::fflush(stdout);
+          }
+        }
+      } else {
+        ++stats.handshakes_rejected;  // unknown public key or bad mac1
+      }
+      return true;
+    }
+
+    if (header && header->type == vpn::wire::MessageType::kTransportData) {
+      const std::uint32_t index = header->transport.receiver_index;
+      // O(1) session lookup. This used to scan every peer for every packet:
+      // at 5k peers and 100k pps that is 5e8 session-index comparisons per
+      // second, purely to discard packets that are not ours.
+      const auto mapped = peer_by_index.find(index);
+      if (mapped == peer_by_index.end()) {
+        ++stats.dropped;  // no session with that index
+        return true;
+      }
+      Peer& peer = peers[mapped->second];
+      {
+        // Drop traffic from a lapsed peer even if the session was set up
+        // before it expired.
+        if (peer.config.expires_at != 0 && peer.config.expires_at <= unix_now()) {
+          ++stats.transport_dropped;
+          return true;
+        }
+        auto opened = peer.session.open(MutableByteSpan{datagram.data(), packet.size()});
+        if (!opened) return true;
+        ++stats.transport_in;
+        ++peer.rx_packets;
+        if (peer.rx_packets == 1) {
+          // Operational signal (no payload content): proves the transport keys
+          // agree end to end, which is what an interop test needs to assert.
+          std::printf("peer %s: first transport packet accepted (%zu bytes inner)\n",
+                      peer.config.name.c_str(), opened->size());
+          std::fflush(stdout);
+        }
+        peer.endpoint = from;  // authenticated: safe to follow the peer
+        peer.endpoint_len = static_cast<int>(from_len);
+        if (!opened->empty() && tun.available()) (void)tun.write_packet(*opened);
+      }
+      return true;
+    }
+    ++stats.dropped;
+    return false;
+  };
 
   while (!g_stop.load()) {
     // Periodic pull from the control plane (ADR-0011): new and expired peers are
@@ -778,104 +979,28 @@ int main(int argc, char** argv) {
         std::printf("configuration reloaded: %zu peer(s)\n", peers.size());
       }
     }
+    // One wakeup may find a queue of datagrams waiting, not just one. Drain up to
+    // kRxBatch of them per wakeup - one recvmmsg() on Linux, a recvfrom() loop
+    // elsewhere - and stop as soon as the socket would block, then go back to
+    // select() so other peers (and the TUN side) get their turn.
+    bool consumed = false;
     if (FD_ISSET(socket.fd, &read_set)) {
-      sockaddr_storage from{};
-      socklen_t from_len = sizeof(from);
-      // `recvfrom` returns ssize_t on POSIX and int on Windows; `auto` keeps both
-      // exact. Naming it `int` truncated the value and is a -Wshorten-64-to-32
-      // error on the Linux build.
-      const auto received =
-          ::recvfrom(socket.fd, reinterpret_cast<char*>(datagram),
-                     static_cast<SendSize>(sizeof(datagram)), 0, reinterpret_cast<sockaddr*>(&from),
-                     &from_len);
-      if (received > 0) {
-        const ByteSpan packet{datagram, static_cast<std::size_t>(received)};
-        const auto header = vpn::wire::decode(packet);
-
-        if (header && header->type == vpn::wire::MessageType::kHandshakeInitiation) {
-          auto responder = vpn::wire::NoiseIk::responder(server_keys);
-          vpn::crypto::X25519PublicKey learned{};
-          Peer* owner = nullptr;
-          if (responder && responder->consume_initiation(packet, learned)) {
-            for (Peer& peer : peers) {
-              if (vpn::equals(vpn::as_span(peer.config.public_key), vpn::as_span(learned))) {
-                owner = &peer;
-                break;
-              }
-            }
-          }
-          if (owner != nullptr) {
-            // Paid access lapses on the server side, not on the client's honour:
-            // an already-installed client gets its handshake refused, so the
-            // tunnel cannot outlive the subscription (ADR-0010).
-            if (owner->config.expires_at != 0 && owner->config.expires_at <= unix_now()) {
-              ++stats.handshakes_rejected;
-              std::printf("peer %s rejected: access expired\n", owner->config.name.c_str());
-              std::fflush(stdout);
-              continue;
-            }
-            Byte response[128];
-            if (responder->create_response(MutableByteSpan{response, sizeof(response)})) {
-              (void)::sendto(socket.fd, reinterpret_cast<const char*>(response),
-                             static_cast<SendSize>(vpn::wire::kHandshakeResponseSize), 0,
-                             reinterpret_cast<const sockaddr*>(&from), from_len);
-              if (owner->session.init(responder->keys()).ok()) {
-                owner->endpoint = from;
-                owner->endpoint_len = static_cast<int>(from_len);
-                owner->established = true;
-                rebuild_index();  // the new session index must be findable
-                ++stats.handshakes_ok;
-                std::printf("peer %s established (local index %u)\n",
-                            owner->config.name.c_str(), owner->session.local_index());
-                std::fflush(stdout);
-              }
-            }
-          } else {
-            ++stats.handshakes_rejected;  // unknown public key or bad mac1
-          }
-          continue;
+      RxSlot slots[kRxBatch];
+      const std::size_t count = receive_batch(socket.fd, slots, kRxBatch);
+      for (std::size_t i = 0; i < count; ++i) {
+        if (slots[i].size == 0) continue;
+        // The single-datagram loop used to `continue` after every handshake or
+        // transport packet, which skipped the TUN read for that iteration. Keep
+        // that rule so behaviour is unchanged; a TUN that is ready is reported by
+        // the very next select() anyway.
+        if (handle_datagram(MutableByteSpan{g_rx_buffers[i], slots[i].size}, slots[i].from,
+                            slots[i].from_len)) {
+          consumed = true;
         }
-
-        if (header && header->type == vpn::wire::MessageType::kTransportData) {
-          const std::uint32_t index = header->transport.receiver_index;
-          // O(1) session lookup. This used to scan every peer for every packet:
-          // at 5k peers and 100k pps that is 5e8 session-index comparisons per
-          // second, purely to discard packets that are not ours.
-          const auto mapped = peer_by_index.find(index);
-          if (mapped == peer_by_index.end()) {
-            ++stats.dropped;  // no session with that index
-            continue;
-          }
-          Peer& peer = peers[mapped->second];
-          {
-            // Drop traffic from a lapsed peer even if the session was set up
-            // before it expired.
-            if (peer.config.expires_at != 0 && peer.config.expires_at <= unix_now()) {
-              ++stats.transport_dropped;
-              continue;
-            }
-            auto opened = peer.session.open(MutableByteSpan{datagram, packet.size()});
-            if (!opened) continue;
-            ++stats.transport_in;
-            ++peer.rx_packets;
-            if (peer.rx_packets == 1) {
-              // Operational signal (no payload content): proves the transport keys
-              // agree end to end, which is what an interop test needs to assert.
-              std::printf("peer %s: first transport packet accepted (%zu bytes inner)\n",
-                          peer.config.name.c_str(), opened->size());
-              std::fflush(stdout);
-            }
-            peer.endpoint = from;  // authenticated: safe to follow the peer
-            peer.endpoint_len = static_cast<int>(from_len);
-            if (!opened->empty() && tun.available()) (void)tun.write_packet(*opened);
-          }
-          continue;
-        }
-        ++stats.dropped;
       }
     }
 
-    if (tun.available() && FD_ISSET(static_cast<Socket>(tun.fd()), &read_set)) {
+    if (!consumed && tun.available() && FD_ISSET(static_cast<Socket>(tun.fd()), &read_set)) {
       const long length = tun.read_packet(inner, sizeof(inner));
       if (length >= 20) {  // minimum IPv4 header
         const std::uint32_t destination = vpn::load_be32(inner + 16);
