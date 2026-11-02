@@ -367,28 +367,31 @@ void send_problem(SocketHandle fd, int status, std::string_view title) {
   return false;
 }
 
-// Case-insensitive header lookup on an already-received header block. Returns the
-// trimmed value, or an empty string when the header is absent.
-[[nodiscard]] std::string header_value(std::string_view header_block, std::string_view name) {
-  std::string lower{header_block};
-  for (char& c : lower) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+// Case-insensitive header lookup with no copy of the block: this runs twice per
+// request, and lowercasing the whole header block twice was pure waste. Only the
+// value is materialised.
+[[nodiscard]] std::string header_value(std::string_view block, std::string_view name) {
+  const auto lower = [](char c) {
+    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+  };
+  for (std::size_t i = 0; i + 2 < block.size(); ++i) {
+    if (block[i] != '\r' || block[i + 1] != '\n') continue;
+    std::size_t j = i + 2;
+    std::size_t k = 0;
+    while (k < name.size() && j < block.size() && lower(block[j]) == name[k]) {
+      ++j;
+      ++k;
+    }
+    if (k != name.size() || j >= block.size() || block[j] != ':') continue;
+    ++j;
+    while (j < block.size() && (block[j] == ' ' || block[j] == '\t')) ++j;
+    std::size_t end = block.find("\r\n", j);
+    if (end == std::string_view::npos) end = block.size();
+    std::string value{block.substr(j, end - j)};
+    for (char& c : value) c = lower(c);
+    return value;
   }
-  const std::string needle = "\r\n" + std::string{name} + ":";
-  const std::size_t at = lower.find(needle);
-  if (at == std::string::npos) return {};
-  std::size_t start = at + needle.size();
-  while (start < header_block.size() &&
-         (header_block[start] == ' ' || header_block[start] == '\t')) {
-    ++start;
-  }
-  std::size_t end = header_block.find("\r\n", start);
-  if (end == std::string::npos) end = header_block.size();
-  std::string value{header_block.substr(start, end - start)};
-  for (char& c : value) {
-    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
-  }
-  return value;
+  return {};
 }
 
 // Liveness/readiness/metrics must stay reachable over plain HTTP: Kubernetes

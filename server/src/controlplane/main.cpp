@@ -265,6 +265,10 @@ int main(int argc, char** argv) {
   vpn::api::RouterOptions router_options;
   router_options.store = store->get();
   router_options.token_ttl_seconds = 3600;
+  // [rate_limit] was parsed and then ignored: the router always ran with its
+  // defaults, so a config knob silently did nothing.
+  router_options.rate_limit_per_second = cfg.rate_limit.requests_per_second;
+  router_options.rate_limit_burst = cfg.rate_limit.burst;
   // The renewal-reminder endpoint needs the SMTP relay settings; empty host means
   // "not configured", which the endpoint reports as 503 rather than pretending.
   router_options.smtp_host = cfg.smtp.host;
@@ -285,6 +289,9 @@ int main(int argc, char** argv) {
   vpn::controlplane::HttpServer::Options metrics_options = api_options;
   metrics_options.bind = cfg.metrics_bind;
   metrics_options.metrics_only = true;
+  // Scrapes are rare and tiny; inheriting the API listener's 64-connection pool
+  // meant 64 idle worker threads (and their stacks) per process.
+  metrics_options.max_concurrent_connections = 4;
   metrics_options.dev_mode = false;
   metrics_options.service_name = "vpnd-metrics";
   auto metrics_server =

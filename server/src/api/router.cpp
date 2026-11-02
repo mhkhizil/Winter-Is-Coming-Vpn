@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <iterator>
 
 #include "vpn/common/bytes.hpp"
 #include "vpn/common/result_helpers.hpp"
@@ -117,8 +118,22 @@ bool Router::field(const std::string& json_body, const char* name, std::string& 
 
 bool Router::allow(const std::string& client_ip) {
   const std::lock_guard<std::mutex> lock(buckets_mutex_);
-  Bucket& bucket = buckets_[client_ip];
   const std::int64_t now = now_ms();
+
+  // The bucket table is keyed by client address, so it must be bounded: an
+  // attacker rotating source addresses would otherwise grow it without limit (one
+  // Bucket per address, forever - a slow but unbounded leak). Evict idle buckets
+  // first, and only clear wholesale as a last resort.
+  constexpr std::size_t kMaxBuckets = 4096;
+  constexpr std::int64_t kIdleMs = 60000;
+  if (buckets_.size() >= kMaxBuckets) {
+    for (auto it = buckets_.begin(); it != buckets_.end();) {
+      it = (now - it->second.last_refill_ms > kIdleMs) ? buckets_.erase(it) : std::next(it);
+    }
+    if (buckets_.size() >= kMaxBuckets) buckets_.clear();
+  }
+
+  Bucket& bucket = buckets_[client_ip];
   if (bucket.last_refill_ms == 0) {
     bucket.tokens = static_cast<double>(options_.rate_limit_burst);
     bucket.last_refill_ms = now;

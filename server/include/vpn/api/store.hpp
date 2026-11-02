@@ -197,6 +197,8 @@ class Store {
   [[nodiscard]] AccessGrant access_grant_locked(const std::string& user_id) const;
   [[nodiscard]] Status reset_password_locked(const std::string& user_id, std::string_view next);
   [[nodiscard]] Status append_line(const std::string& line);
+  // fsync the log to disk (no-op where the platform offers nothing portable).
+  void sync_log() noexcept;
   void replay(const std::string& content);
   [[nodiscard]] bool ip_taken(std::string_view ipv4) const;
   [[nodiscard]] Result<std::string> allocate_ipv4();
@@ -204,9 +206,14 @@ class Store {
   mutable std::mutex mutex_;
   StoreOptions options_{};
   std::FILE* log_{nullptr};
+  // While the log is being rewritten at startup we append thousands of records and
+  // fsync once at the end, instead of paying one fsync per record.
+  bool skip_fsync_{false};
   std::uint64_t next_ip_{2};  // .1 is the server
 
   std::unordered_map<std::string, std::string> user_email_to_id_;
+  // Reverse index: without it every account listing was O(n^2).
+  std::unordered_map<std::string, std::string> user_to_email_;
   std::unordered_map<std::string, Principal> users_;
   std::unordered_map<std::string, std::string> password_hashes_;
   std::unordered_map<std::string, std::string> token_to_user_;

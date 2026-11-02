@@ -9,6 +9,7 @@
 #endif
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>
 
 #include "vpn/common/bytes.hpp"
 #include "vpn/common/result_helpers.hpp"
@@ -116,11 +117,17 @@ Status Store::append_line(const std::string& line) {
   }
 #if !defined(_WIN32)
   // Durability: a control plane that loses a peer record on power loss would
-  // resurrect a revoked key. Windows has no fsync(); FlushFileBuffers via
-  // fflush is the best portable approximation here.
-  (void)::fsync(::fileno(log_));
+  // resurrect a revoked key. Skipped only during the startup rewrite, which
+  // fsyncs once when it is done.
+  if (!skip_fsync_) (void)::fsync(::fileno(log_));
 #endif
   return Status{};
+}
+
+void Store::sync_log() noexcept {
+#if !defined(_WIN32)
+  if (log_ != nullptr) (void)::fsync(::fileno(log_));
+#endif
 }
 
 void Store::replay(const std::string& content) {
@@ -143,6 +150,7 @@ void Store::replay(const std::string& content) {
       principal.role = f[5];
       users_[principal.user_id] = principal;
       user_email_to_id_[f[3]] = principal.user_id;
+      user_to_email_[principal.user_id] = f[3];
       password_hashes_[principal.user_id] = f[4];
     } else if (kind == "E" && f.size() >= 5) {
       // Entitlement: who may use the service, until when.
@@ -228,11 +236,21 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
   std::unordered_map<std::string, std::string> email_by_id;
   for (const auto& entry : store->user_email_to_id_) email_by_id[entry.second] = entry.first;
 
-  std::FILE* rewrite = std::fopen(options.path.c_str(), "wb");
+  // Rewrite into a temporary file and rename it over the log, instead of opening
+  // the real log with "wb". Two reasons:
+  //   1. atomicity - the old code emptied the live log for the whole duration of
+  //      the rewrite, so a crash or power loss mid-compaction could truncate real
+  //      state (users, peers, revocations).
+  //   2. speed - the records are appended with fsync disabled and flushed once at
+  //      the end: one fsync instead of one per record. On a real disk (0.1-10 ms
+  //      per fsync) a 10k-record store spent seconds here on every start.
+  const std::string compaction_path = options.path + ".compacting";
+  std::FILE* rewrite = std::fopen(compaction_path.c_str(), "wb");
   if (rewrite == nullptr) {
-    return make_error(ErrorCode::kUnavailable, "cannot rewrite the store log");
+    return make_error(ErrorCode::kUnavailable, "cannot write the compaction file");
   }
   store->log_ = rewrite;
+  store->skip_fsync_ = true;
   for (const auto& entry : store->users_) {
     const std::string& id = entry.first;
     const Principal& principal = entry.second;
@@ -272,7 +290,28 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
     (void)store->append_line("S\t" + node.id + "\t" + node.region + "\t" + node.host + "\t" +
                              std::to_string(node.port) + "\t" + node.public_key_hex);
   }
+  // One flush + one fsync for the whole rewrite, then an atomic replace.
+  if (std::fflush(rewrite) != 0) {
+    std::fclose(rewrite);
+    store->log_ = nullptr;
+    return make_error(ErrorCode::kUnavailable, "cannot flush the compaction file");
+  }
+  store->sync_log();
+  store->skip_fsync_ = false;
   std::fclose(rewrite);
+  store->log_ = nullptr;
+
+  {
+    std::error_code replace_error;
+    std::filesystem::rename(compaction_path, options.path, replace_error);
+    if (replace_error) {
+      std::error_code ignored;
+      std::filesystem::remove(compaction_path, ignored);
+      return make_error(ErrorCode::kUnavailable,
+                        "cannot replace the store log: " + replace_error.message());
+    }
+  }
+
   store->log_ = std::fopen(options.path.c_str(), "ab");
   if (store->log_ == nullptr) {
     return make_error(ErrorCode::kUnavailable, "cannot append to the store log");
@@ -311,6 +350,7 @@ Status Store::add_user(std::string_view email, std::string_view password, std::s
   if (!appended) return appended;
   users_[principal.user_id] = principal;
   user_email_to_id_[email_key] = principal.user_id;
+  user_to_email_[principal.user_id] = email_key;
   password_hashes_[principal.user_id] = hash;
   return Status{};
 }
@@ -646,12 +686,13 @@ UserRecord to_record(const std::string& id, const Principal& principal, const st
   return record;
 }
 
-std::string email_of(const std::unordered_map<std::string, std::string>& by_email,
+// Reverse index (user id -> email). Kept alongside the forward map so that listing
+// accounts is O(n) and not O(n^2): the old version scanned every user for each
+// user, and scanned every user for each peer in render_dp_config.
+std::string email_of(const std::unordered_map<std::string, std::string>& by_user,
                      const std::string& user_id) {
-  for (const auto& entry : by_email) {
-    if (entry.second == user_id) return entry.first;
-  }
-  return {};
+  const auto it = by_user.find(user_id);
+  return it == by_user.end() ? std::string{} : it->second;
 }
 }  // namespace
 
@@ -738,6 +779,7 @@ Result<UserRecord> Store::create_user(const Principal& actor, std::string_view e
 
   users_[principal.user_id] = principal;
   user_email_to_id_[email_key] = principal.user_id;
+  user_to_email_[principal.user_id] = email_key;
   password_hashes_[principal.user_id] = hash;
   access_[principal.user_id] = grant;
   return to_record(principal.user_id, principal, email_key, grant);
@@ -753,7 +795,7 @@ Result<std::vector<UserRecord>> Store::list_users(const Principal& actor) const 
   for (const auto& entry : users_) {
     const Principal& principal = entry.second;
     out.push_back(to_record(principal.user_id, principal,
-                            email_of(user_email_to_id_, principal.user_id),
+                            email_of(user_to_email_, principal.user_id),
                             access_grant_locked(principal.user_id)));
   }
   return out;
@@ -766,7 +808,7 @@ Result<UserRecord> Store::get_user(const Principal& actor, std::string_view user
   }
   const auto it = users_.find(std::string{user_id});
   if (it == users_.end()) return make_error(ErrorCode::kNotFound, "no such user");
-  return to_record(it->first, it->second, email_of(user_email_to_id_, it->first),
+  return to_record(it->first, it->second, email_of(user_to_email_, it->first),
                    access_grant_locked(it->first));
 }
 
@@ -790,7 +832,7 @@ Result<UserRecord> Store::grant_access(const Principal& actor, std::string_view 
                                       "\t" + grant.plan + "\t" + grant.status);
   if (!appended) return make_error(appended.code(), appended.message());
   access_[it->first] = grant;
-  return to_record(it->first, it->second, email_of(user_email_to_id_, it->first), grant);
+  return to_record(it->first, it->second, email_of(user_to_email_, it->first), grant);
 }
 
 Status Store::revoke_access(const Principal& actor, std::string_view user_id) {
@@ -879,7 +921,7 @@ Result<std::vector<Store::ExpiringAccount>> Store::accounts_expiring_within(
     if (grant.expires_at <= now || grant.expires_at > horizon) continue;
     if (reminders_.count(entry.first + "|" + std::string{bucket}) != 0) continue;
     ExpiringAccount account;
-    account.user = to_record(entry.first, entry.second, email_of(user_email_to_id_, entry.first),
+    account.user = to_record(entry.first, entry.second, email_of(user_to_email_, entry.first),
                              grant);
     account.email = account.user.email;
     out.push_back(account);
