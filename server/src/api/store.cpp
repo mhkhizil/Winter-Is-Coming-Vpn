@@ -1,6 +1,7 @@
 // Copyright 2026 The vpn authors. SPDX-License-Identifier: Apache-2.0
 //
 // File-backed control-plane store (see store.hpp for the record format).
+#include <cstdint>
 #include "vpn/api/store.hpp"
 
 #include <chrono>

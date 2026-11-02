@@ -8,6 +8,7 @@
 //   h  = HASH(h  || responder_static)
 // and every message field is mixed into h before the next AEAD is sealed/opened.
 // Any deviation here shows up as an authentication failure, never as a crash.
+#include <cstdint>
 #include "vpn/wire/noise.hpp"
 
 #include <chrono>

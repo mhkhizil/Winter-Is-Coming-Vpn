@@ -157,6 +157,11 @@ jobs:
       - name: Docs links and structure
         run: python3 scripts/check_docs.py
 
+      # libc++ (zig) pulls <cstdint> in transitively, libstdc++ (gcc in CI) does not,
+      # so a missing include compiles locally and breaks the gcc job.
+      - name: Include hygiene (std::int*_t / std::uint*_t need <cstdint>)
+        run: python3 scripts/check_includes.py
+
       - name: Docs claims (links, ADR shape, forbidden terms, key material)
         run: echo "covered by .github/workflows/docs-lint.yml"
 

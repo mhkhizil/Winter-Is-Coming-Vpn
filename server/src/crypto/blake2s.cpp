@@ -4,6 +4,7 @@
 // Straightforward, branch-free-on-secrets reference shape: the compression
 // function is the only hot loop and is written so a compiler can vectorise the
 // G mixing rounds later (see docs/PROTOCOL.md, "Performance envelope").
+#include <cstdint>
 #include "vpn/crypto/blake2s.hpp"
 
 #include <cstring>

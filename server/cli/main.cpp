@@ -13,6 +13,7 @@
 //
 // The token comes from --token, then $VPN_TOKEN, then the file written by login
 // ($VPN_TOKEN_FILE, else ~/.vpn/token).
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

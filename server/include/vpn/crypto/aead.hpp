@@ -10,6 +10,7 @@
 // bytes of the destination buffer. Comparisons of the tag are constant-time.
 #pragma once
 
+#include <cstdint>
 #include <cstddef>
 
 #include "vpn/common/bytes.hpp"

@@ -5,6 +5,7 @@
 // CI-blocking offence (see the grep gate in .github/workflows/ci-server.yml).
 #pragma once
 
+#include <cstdint>
 #include <cstddef>
 
 #include "vpn/common/bytes.hpp"

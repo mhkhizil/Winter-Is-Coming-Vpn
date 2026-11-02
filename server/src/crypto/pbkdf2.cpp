@@ -1,4 +1,5 @@
 // Copyright 2026 The vpn authors. SPDX-License-Identifier: Apache-2.0
+#include <cstdint>
 #include "vpn/crypto/pbkdf2.hpp"
 
 #include <cstring>
