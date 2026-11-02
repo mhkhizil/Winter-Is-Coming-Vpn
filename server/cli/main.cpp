@@ -132,7 +132,14 @@ struct Reply {
   for (addrinfo* it = addresses; it != nullptr; it = it->ai_next) {
     fd = static_cast<SocketHandle>(::socket(it->ai_family, it->ai_socktype, it->ai_protocol));
     if (fd == kNoSocket) continue;
-    if (::connect(fd, it->ai_addr, static_cast<int>(it->ai_addrlen)) == 0) break;
+    // socklen_t is unsigned on Linux and int on Windows; casting to a fixed type
+    // here is what -Wsign-conversion objects to.
+#if defined(_WIN32)
+    const int addr_len = static_cast<int>(it->ai_addrlen);
+#else
+    const socklen_t addr_len = static_cast<socklen_t>(it->ai_addrlen);
+#endif
+    if (::connect(fd, it->ai_addr, addr_len) == 0) break;
     close_socket(fd);
     fd = kNoSocket;
   }

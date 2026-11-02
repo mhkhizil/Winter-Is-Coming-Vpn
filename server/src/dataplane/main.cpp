@@ -544,7 +544,10 @@ int main(int argc, char** argv) {
     if (FD_ISSET(socket.fd, &read_set)) {
       sockaddr_storage from{};
       socklen_t from_len = sizeof(from);
-      const int received =
+      // `recvfrom` returns ssize_t on POSIX and int on Windows; `auto` keeps both
+      // exact. Naming it `int` truncated the value and is a -Wshorten-64-to-32
+      // error on the Linux build.
+      const auto received =
           ::recvfrom(socket.fd, reinterpret_cast<char*>(datagram),
                      static_cast<SendSize>(sizeof(datagram)), 0, reinterpret_cast<sockaddr*>(&from),
                      &from_len);
