@@ -40,6 +40,20 @@ class Router {
   [[nodiscard]] controlplane::HttpResponse handle(const controlplane::HttpRequest& request);
 
  private:
+  // --- login throttling (per account) ---------------------------------------
+  // Counted per email, not per IP: the attacker rotates addresses, the account
+  // they are attacking does not. Locking happens BEFORE the password hash is
+  // computed, so a locked account costs no CPU at all.
+  struct LoginState {
+    std::uint32_t failures{0};
+    std::int64_t window_start_ms{0};
+    std::int64_t locked_until_ms{0};
+  };
+  [[nodiscard]] bool login_locked(const std::string& email) const;
+  void login_failed(const std::string& email);
+  void login_succeeded(const std::string& email);
+  mutable std::mutex login_mutex_;
+  std::unordered_map<std::string, LoginState> login_attempts_;
   struct Bucket {
     double tokens{0};
     std::int64_t last_refill_ms{0};

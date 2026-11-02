@@ -15,6 +15,7 @@ add_library(vpn_core STATIC
   src/crypto/chacha20poly1305.cpp
   src/crypto/ct.cpp
   src/crypto/kdf.cpp
+  src/crypto/pbkdf2.cpp
   src/crypto/random.cpp
   src/crypto/sha256.cpp
   src/crypto/x25519.cpp

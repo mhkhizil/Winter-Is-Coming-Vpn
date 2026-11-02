@@ -15,6 +15,7 @@
 #include "vpn/common/result_helpers.hpp"
 #include "vpn/crypto/blake2s.hpp"
 #include "vpn/crypto/ct.hpp"
+#include "vpn/crypto/pbkdf2.hpp"
 #include "vpn/crypto/kdf.hpp"
 #include "vpn/crypto/random.hpp"
 
@@ -42,12 +43,32 @@ std::string pepper() {
   return value == nullptr ? std::string{"vpn-dev-pepper"} : std::string{value};
 }
 
-// Passwords are never stored: only HMAC-BLAKE2s-256(pepper, password), hex.
-// Hex of a 32-byte HMAC is always 64 characters; used for the constant-time
-// comparison of password hashes.
-constexpr std::size_t kPasswordHashLength = 64;
+// Credentials at rest.
+//
+// Passwords: PBKDF2-HMAC-SHA256 with a per-password salt and a work factor, because
+// a single fast MAC (what this used to be) is trivially brute-forced offline the
+// moment the store file leaks. Stored format is self-describing and versioned so an
+// old log can be upgraded in place:
+//
+//   pbkdf2-sha256$<iterations>$<salt-hex>$<derived-hex>
+//
+// Tokens are different: they are 256-bit random values, so a peppered HMAC is the
+// right tool - there is nothing to brute-force, and it must stay cheap because it
+// runs on every authenticated request.
+constexpr std::size_t kPasswordSaltBytes = 16;
+constexpr std::uint32_t kDefaultPbkdf2Iterations = 120000;
 
-std::string hash_password(std::string_view password) {
+std::uint32_t pbkdf2_iterations() {
+  // Tests and constrained devices may lower this; the floor keeps it meaningful.
+  const char* value = std::getenv("VPN_PBKDF2_ITERATIONS");
+  if (value == nullptr) return kDefaultPbkdf2Iterations;
+  const long parsed = std::strtol(value, nullptr, 10);
+  if (parsed < 10000 || parsed > 4000000) return kDefaultPbkdf2Iterations;
+  return static_cast<std::uint32_t>(parsed);
+}
+
+// Legacy format, kept only to verify and then upgrade existing hashes.
+std::string legacy_blake2s_hash(std::string_view password) {
   const std::string key = pepper();
   Bytes<32> mac = crypto::hmac_blake2s_256(
       ByteSpan{reinterpret_cast<const Byte*>(key.data()), key.size()},
@@ -55,6 +76,62 @@ std::string hash_password(std::string_view password) {
   const std::string out = to_hex(as_span(mac));
   ::vpn::ct::cleanse(as_span(mac));
   return out;
+}
+
+std::string hash_password(std::string_view password) {
+  Byte salt[kPasswordSaltBytes] = {};
+  if (!crypto::fill_random(MutableByteSpan{salt, sizeof(salt)})) return {};
+  const std::uint32_t iterations = pbkdf2_iterations();
+  Bytes<32> derived = crypto::pbkdf2_sha256(
+      ByteSpan{reinterpret_cast<const Byte*>(password.data()), password.size()},
+      ByteSpan{salt, sizeof(salt)}, iterations);
+  std::string out = "pbkdf2-sha256$" + std::to_string(iterations) + "$" +
+                    vpn::to_hex(ByteSpan{salt, sizeof(salt)}) + "$" + to_hex(as_span(derived));
+  ::vpn::ct::cleanse(MutableByteSpan{salt, sizeof(salt)});
+  ::vpn::ct::cleanse(as_span(derived));
+  return out;
+}
+
+// True when `password` matches `stored`, in either the current or the legacy
+// format. Comparison is constant-time in both cases.
+bool verify_password(const std::string& stored, std::string_view password) {
+  const std::string prefix = "pbkdf2-sha256$";
+  if (stored.rfind(prefix, 0) != 0) {
+    const std::string candidate = legacy_blake2s_hash(password);
+    return ::vpn::ct::equal(
+        ByteSpan{reinterpret_cast<const Byte*>(candidate.data()), candidate.size()},
+        ByteSpan{reinterpret_cast<const Byte*>(stored.data()), stored.size()});
+  }
+
+  // pbkdf2-sha256$<iterations>$<salt>$<derived>
+  const std::size_t first = stored.find('$', prefix.size());
+  if (first == std::string::npos) return false;
+  const std::size_t second = stored.find('$', first + 1);
+  if (second == std::string::npos) return false;
+  const long iterations = std::strtol(stored.substr(prefix.size(),
+                                                    first - prefix.size()).c_str(),
+                                      nullptr, 10);
+  if (iterations < 1 || iterations > 4000000) return false;
+  const std::string salt_hex = stored.substr(first + 1, second - first - 1);
+  const std::string derived_hex = stored.substr(second + 1);
+
+  Byte salt[kPasswordSaltBytes] = {};
+  if (salt_hex.size() != kPasswordSaltBytes * 2) return false;
+  for (std::size_t i = 0; i < kPasswordSaltBytes; ++i) {
+    const auto byte = static_cast<unsigned>(std::strtoul(salt_hex.substr(i * 2, 2).c_str(),
+                                                         nullptr, 16));
+    salt[i] = static_cast<Byte>(byte);
+  }
+
+  Bytes<32> derived = crypto::pbkdf2_sha256(
+      ByteSpan{reinterpret_cast<const Byte*>(password.data()), password.size()},
+      ByteSpan{salt, sizeof(salt)}, static_cast<std::uint32_t>(iterations));
+  const std::string candidate = to_hex(as_span(derived));
+  ::vpn::ct::cleanse(as_span(derived));
+  ::vpn::ct::cleanse(MutableByteSpan{salt, sizeof(salt)});
+  return ::vpn::ct::equal(
+      ByteSpan{reinterpret_cast<const Byte*>(candidate.data()), candidate.size()},
+      ByteSpan{reinterpret_cast<const Byte*>(derived_hex.data()), derived_hex.size()});
 }
 
 std::string hash_token(std::string_view token) {
@@ -159,6 +236,14 @@ void Store::replay(const std::string& content) {
       grant.plan = f[3];
       grant.status = f[4];
       access_[f[1]] = grant;
+    } else if (kind == "A" && f.size() >= 5) {
+      AuditEntry entry;
+      entry.actor = f[1];
+      entry.action = f[2];
+      entry.target = f[3];
+      entry.at = std::atoll(f[4].c_str());
+      audit_.push_back(entry);
+      if (audit_.size() > 4096) audit_.erase(audit_.begin());
     } else if (kind == "R" && f.size() >= 4) {
       // Reminder already sent for (user, bucket); keeps the daily job idempotent.
       reminders_[f[1] + "|" + f[2]] = std::atoll(f[3].c_str());
@@ -271,6 +356,10 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
     emit("E\t" + entry.first + "\t" + std::to_string(entry.second.expires_at) + "\t" +
          entry.second.plan + "\t" + entry.second.status);
   }
+  for (const AuditEntry& entry : store->audit_) {
+    emit("A\t" + entry.actor + "\t" + entry.action + "\t" + entry.target + "\t" +
+         std::to_string(entry.at));
+  }
   for (const auto& entry : store->reminders_) {
     const std::size_t bar = entry.first.find('|');
     if (bar == std::string::npos) continue;
@@ -378,13 +467,17 @@ Result<Principal> Store::authenticate(std::string_view email, std::string_view p
   if (it == user_email_to_id_.end()) {
     return make_error(ErrorCode::kUnauthenticated, "no such user");
   }
-  const std::string candidate = hash_password(password);
   const std::string& stored = password_hashes_[it->second];
-  const bool same =
-      ::vpn::ct::equal(ByteSpan{reinterpret_cast<const Byte*>(candidate.data()), candidate.size()},
-                       ByteSpan{reinterpret_cast<const Byte*>(stored.data()), stored.size()});
-  if (!same) {
-    return make_error(ErrorCode::kUnauthenticated, "wrong password");
+  if (!verify_password(stored, password)) {
+    // One message for "no such user" and "wrong password": the caller must not be
+    // able to enumerate accounts.
+    return make_error(ErrorCode::kUnauthenticated, "invalid credentials");
+  }
+  // Transparent upgrade: a password still stored in the legacy fast-MAC format is
+  // re-hashed with PBKDF2 on its next successful login, so an existing store
+  // migrates itself without locking anyone out.
+  if (stored.rfind("pbkdf2-sha256$", 0) != 0) {
+    (void)reset_password_locked(it->second, password);
   }
   return users_[it->second];
 }
@@ -799,6 +892,7 @@ Result<UserRecord> Store::create_user(const Principal& actor, std::string_view e
   user_to_email_[principal.user_id] = email_key;
   password_hashes_[principal.user_id] = hash;
   access_[principal.user_id] = grant;
+  (void)record_audit_locked(actor, "user.create", principal.user_id);
   return to_record(principal.user_id, principal, email_key, grant);
 }
 
@@ -849,6 +943,7 @@ Result<UserRecord> Store::grant_access(const Principal& actor, std::string_view 
                                       "\t" + grant.plan + "\t" + grant.status);
   if (!appended) return make_error(appended.code(), appended.message());
   access_[it->first] = grant;
+  (void)record_audit_locked(actor, "user.grant", it->first);
   return to_record(it->first, it->second, email_of(user_to_email_, it->first), grant);
 }
 
@@ -870,6 +965,7 @@ Status Store::revoke_access(const Principal& actor, std::string_view user_id) {
                                       "\t" + grant.plan + "\t" + grant.status);
   if (!appended) return appended;
   access_[it->first] = grant;
+  (void)record_audit_locked(actor, "user.revoke", it->first);
   return Status{};
 }
 
@@ -881,10 +977,7 @@ Status Store::change_password(const Principal& actor, std::string_view current,
   if (next.size() < 8) {
     return Status{ErrorCode::kInvalidArgument, "the new password must be at least 8 characters"};
   }
-  if (!ct::equal(ByteSpan{reinterpret_cast<const Byte*>(hash_password(current).data()),
-                          kPasswordHashLength},
-                 ByteSpan{reinterpret_cast<const Byte*>(password_hashes_[it->first].data()),
-                          kPasswordHashLength})) {
+  if (!verify_password(password_hashes_[it->first], current)) {
     // Same message either way: never reveal whether the old password was close.
     return Status{ErrorCode::kUnauthenticated, "current password is incorrect"};
   }
@@ -992,6 +1085,41 @@ Result<std::string> Store::render_dp_config(const Principal& actor,
     ++peers;
   }
   if (peers == 0) out += "\n# no active peers yet\n";
+  return out;
+}
+
+Status Store::record_audit_locked(const Principal& actor, std::string_view action,
+                                  std::string_view target) {
+  const std::int64_t at = now_unix();
+  const Status appended = append_line("A\t" + actor.user_id + "\t" + std::string{action} + "\t" +
+                                     std::string{target} + "\t" + std::to_string(at));
+  if (!appended) return appended;
+  AuditEntry entry;
+  entry.actor = actor.user_id;
+  entry.action = std::string{action};
+  entry.target = std::string{target};
+  entry.at = at;
+  audit_.push_back(entry);
+  if (audit_.size() > 4096) audit_.erase(audit_.begin());
+  return Status{};
+}
+
+Status Store::record_audit(const Principal& actor, std::string_view action,
+                           std::string_view target) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return record_audit_locked(actor, action, target);
+}
+
+Result<std::vector<Store::AuditEntry>> Store::list_audit(const Principal& actor,
+                                                         std::size_t limit) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  const std::size_t take = (limit == 0 || limit > audit_.size()) ? audit_.size() : limit;
+  std::vector<AuditEntry> out;
+  out.reserve(take);
+  for (std::size_t i = audit_.size() - take; i < audit_.size(); ++i) out.push_back(audit_[i]);
   return out;
 }
 

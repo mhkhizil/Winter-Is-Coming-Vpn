@@ -116,6 +116,38 @@ bool Router::field(const std::string& json_body, const char* name, std::string& 
   return extract_field(json_body, name, out);
 }
 
+// --- login throttling -------------------------------------------------------
+namespace {
+constexpr std::uint32_t kMaxLoginFailures = 5;
+constexpr std::int64_t kLoginWindowMs = 15 * 60 * 1000;
+constexpr std::size_t kMaxLoginEntries = 4096;
+}  // namespace
+
+bool Router::login_locked(const std::string& email) const {
+  const std::lock_guard<std::mutex> lock(login_mutex_);
+  const auto it = login_attempts_.find(email);
+  return it != login_attempts_.end() && it->second.locked_until_ms > now_ms();
+}
+
+void Router::login_failed(const std::string& email) {
+  const std::lock_guard<std::mutex> lock(login_mutex_);
+  // Bounded like the rate-limit buckets: keyed by client-supplied identity.
+  if (login_attempts_.size() >= kMaxLoginEntries) login_attempts_.clear();
+  LoginState& state = login_attempts_[email];
+  const std::int64_t now = now_ms();
+  if (state.window_start_ms == 0 || now - state.window_start_ms > kLoginWindowMs) {
+    state.failures = 0;
+    state.window_start_ms = now;
+  }
+  ++state.failures;
+  if (state.failures >= kMaxLoginFailures) state.locked_until_ms = now + kLoginWindowMs;
+}
+
+void Router::login_succeeded(const std::string& email) {
+  const std::lock_guard<std::mutex> lock(login_mutex_);
+  login_attempts_.erase(email);
+}
+
 bool Router::allow(const std::string& client_ip) {
   const std::lock_guard<std::mutex> lock(buckets_mutex_);
   const std::int64_t now = now_ms();
@@ -251,10 +283,20 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       if (!field(request.body, "email", email) || !field(request.body, "password", password)) {
         return problem(400, "Bad Request", "invalid_argument", "email and password are required");
       }
+      // Refuse BEFORE hashing the password: a locked account must not cost a
+      // PBKDF2 run, and a credential-stuffing run must not get CPU for free. Note
+      // the throttle is per account, not per IP - the attacker rotates addresses,
+      // the account being attacked does not rotate.
+      if (login_locked(email)) {
+        return problem(429, "Too Many Requests", "too_many_attempts",
+                       "too many failed attempts; try again in 15 minutes");
+      }
       auto principal = options_.store->authenticate(email, password);
       if (!principal) {
+        login_failed(email);
         return problem(401, "Unauthorized", "unauthenticated", "invalid credentials");
       }
+      login_succeeded(email);
       auto token = options_.store->issue_token(*principal, options_.token_ttl_seconds);
       if (!token) return problem(500, "Internal Server Error", "internal");
       return json(200, "{\"access_token\":\"" + *token + "\",\"token_type\":\"Bearer\"," +

@@ -129,6 +129,22 @@ class Store {
   // re-enable later). Deletes nothing.
   [[nodiscard]] Status revoke_access(const Principal& actor, std::string_view user_id);
 
+  // --- audit trail ----------------------------------------------------------
+  // Who did what, appended to the same durable log. Not a replacement for an
+  // external audit system, but it means an administrator action (grant, revoke,
+  // password reset, user creation) is attributable after the fact instead of
+  // existing only in whatever chat message prompted it.
+  struct AuditEntry {
+    std::string actor{};   // user id of the administrator
+    std::string action{};  // user.create | user.grant | user.revoke | user.password
+    std::string target{};  // affected user id
+    std::int64_t at{0};    // unix seconds
+  };
+  [[nodiscard]] Status record_audit(const Principal& actor, std::string_view action,
+                                    std::string_view target);
+  [[nodiscard]] Result<std::vector<AuditEntry>> list_audit(const Principal& actor,
+                                                           std::size_t limit) const;
+
   // --- credentials ----------------------------------------------------------
   // The initial password is issued by an administrator, so a way to change it is
   // not optional: otherwise every customer keeps the password that travelled
@@ -196,6 +212,8 @@ class Store {
   [[nodiscard]] bool access_active_locked(const std::string& user_id) const;
   [[nodiscard]] AccessGrant access_grant_locked(const std::string& user_id) const;
   [[nodiscard]] Status reset_password_locked(const std::string& user_id, std::string_view next);
+  [[nodiscard]] Status record_audit_locked(const Principal& actor, std::string_view action,
+                                          std::string_view target);
   [[nodiscard]] Status append_line(const std::string& line);
   // fsync the log to disk (no-op where the platform offers nothing portable).
   void sync_log() noexcept;
@@ -224,6 +242,8 @@ class Store {
   std::unordered_map<std::string, AccessGrant> access_;
   // "<user-id>|<bucket>" -> unix time the reminder was sent (idempotency).
   std::unordered_map<std::string, std::int64_t> reminders_;
+  // Bounded ring of recent audit entries (oldest dropped first).
+  std::vector<AuditEntry> audit_;
 };
 
 }  // namespace vpn::api
