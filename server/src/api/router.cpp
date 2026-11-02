@@ -4,6 +4,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 
 #include "vpn/common/bytes.hpp"
 #include "vpn/common/result_helpers.hpp"
@@ -165,6 +166,42 @@ Result<Principal> Router::authenticate(const HttpRequest& request) const {
   return options_.store->principal_for_token(token);
 }
 
+namespace {
+// Entitlement helpers (ADR-0010): money is collected out of band, so the only
+// thing the service knows is "this account is paid up until <timestamp>".
+constexpr std::int64_t kSecondsPerDay = 86400;
+
+std::string access_status(const AccessGrant& grant, std::int64_t now) {
+  if (grant.status != "active") return grant.status;  // disabled by an administrator
+  if (grant.expires_at != 0 && grant.expires_at <= now) return "expired";
+  return "active";
+}
+
+std::string user_json(const UserRecord& user, std::int64_t now) {
+  std::int64_t days_left = 0;
+  if (user.access.expires_at != 0) {
+    const std::int64_t remaining = user.access.expires_at - now;
+    days_left = remaining > 0 ? (remaining + kSecondsPerDay - 1) / kSecondsPerDay : 0;
+  }
+  return "{\"id\":\"" + escape(user.id) + "\",\"email\":\"" + escape(user.email) +
+         "\",\"role\":\"" + escape(user.role) + "\",\"plan\":\"" + escape(user.access.plan) +
+         "\",\"status\":\"" + access_status(user.access, now) +
+         "\",\"expires_at\":" + std::to_string(user.access.expires_at) +
+         ",\"days_left\":" + std::to_string(days_left) + "}";
+}
+
+int status_for(ErrorCode code) noexcept {
+  switch (code) {
+    case ErrorCode::kPermissionDenied: return 403;
+    case ErrorCode::kNotFound: return 404;
+    case ErrorCode::kAlreadyExists: return 409;
+    case ErrorCode::kInvalidArgument: return 400;
+    case ErrorCode::kMalformed: return 400;
+    default: return 500;
+  }
+}
+}  // namespace
+
 controlplane::HttpResponse Router::handle(const HttpRequest& request) {
   if (options_.store == nullptr) {
     return problem(503, "Service Unavailable", "store_unavailable");
@@ -225,8 +262,129 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
   const Principal& who = *principal;
 
   if (resource == "me" && request.method == "GET") {
+    const std::int64_t now = std::time(nullptr);
+    const AccessGrant grant = options_.store->access_grant(who.user_id);
     return json(200, "{\"user_id\":\"" + escape(who.user_id) + "\",\"tenant_id\":\"" +
-                         escape(who.tenant_id) + "\",\"role\":\"" + escape(who.role) + "\"}");
+                         escape(who.tenant_id) + "\",\"role\":\"" + escape(who.role) +
+                         "\",\"access\":" + user_json(UserRecord{who.user_id, who.tenant_id, "",
+                                                                 who.role, grant}, now) +
+                         "}");
+  }
+
+  // --- administration: accounts and paid access (ADR-0010) -------------------
+  //
+  // Money is collected out of band (transfer, cash, whatever), and an
+  // administrator records the result here. Creating an account requires a
+  // duration; when it runs out the account can no longer obtain a configuration
+  // or a peer, and the data plane stops forwarding for it.
+  if (resource == "admin") {
+    if (who.role != "admin") {
+      return problem(403, "Forbidden", "permission_denied", "administrator role required");
+    }
+    const std::int64_t now = std::time(nullptr);
+
+    const auto code_for = [](int status) {
+      switch (status) {
+        case 409: return "already_exists";
+        case 404: return "not_found";
+        case 403: return "permission_denied";
+        case 400: return "invalid_argument";
+        default: return "internal";
+      }
+    };
+    const auto fail = [&](int status, const std::string& detail) {
+      const char* title = "Bad Request";
+      if (status == 409) title = "Conflict";
+      else if (status == 404) title = "Not Found";
+      else if (status == 403) title = "Forbidden";
+      else if (status >= 500) title = "Internal Server Error";
+      return problem(status, title, code_for(status), detail);
+    };
+
+    // `months` (30-day months, the way operators sell this) or `days`.
+    const auto duration = [&](std::int64_t& out, std::string& plan) {
+      std::string raw;
+      if (field(request.body, "months", raw)) {
+        const long months = std::strtol(raw.c_str(), nullptr, 10);
+        if (months < 1 || months > 120) return false;
+        out = static_cast<std::int64_t>(months) * 30;
+        plan = std::to_string(months) + "m";
+        return true;
+      }
+      if (field(request.body, "days", raw)) {
+        const long days = std::strtol(raw.c_str(), nullptr, 10);
+        if (days < 1 || days > 3650) return false;
+        out = static_cast<std::int64_t>(days);
+        plan = std::to_string(days) + "d";
+        return true;
+      }
+      out = 30;  // default: one month
+      plan = "1m";
+      return true;
+    };
+
+    if (parts.size() >= 4 && parts[3] == "users") {
+      if (parts.size() == 4 && request.method == "POST") {
+        std::string email;
+        std::string password;
+        std::string role;
+        std::string explicit_plan;
+        if (!field(request.body, "email", email) || !field(request.body, "password", password)) {
+          return fail(400, "email and password are required");
+        }
+        (void)field(request.body, "role", role);
+        (void)field(request.body, "plan", explicit_plan);
+        std::int64_t days = 30;
+        std::string plan;
+        if (!duration(days, plan)) return fail(400, "months must be 1..120 (or days 1..3650)");
+        if (!explicit_plan.empty()) plan = explicit_plan;
+        const auto created = options_.store->create_user(
+            who, email, password, role, now + days * kSecondsPerDay, plan);
+        if (!created) return fail(status_for(created.error().code()), created.error().message());
+        return json(201, user_json(*created, now));
+      }
+      if (parts.size() == 4 && request.method == "GET") {
+        const auto users = options_.store->list_users(who);
+        if (!users) return fail(status_for(users.error().code()), users.error().message());
+        std::string body = "{\"data\":[";
+        bool first = true;
+        for (const UserRecord& user : *users) {
+          if (!first) body += ',';
+          first = false;
+          body += user_json(user, now);
+        }
+        body += "]}";
+        return json(200, body);
+      }
+      if (parts.size() == 5 && request.method == "GET") {
+        const auto user = options_.store->get_user(who, parts[4]);
+        if (!user) return fail(status_for(user.error().code()), user.error().message());
+        return json(200, user_json(*user, now));
+      }
+      // POST /api/v1/admin/users/{id}/access  {"months":6}  -> extend
+      if (parts.size() == 6 && request.method == "POST" && parts[5] == "access") {
+        std::int64_t days = 30;
+        std::string plan;
+        std::string explicit_plan;
+        (void)field(request.body, "plan", explicit_plan);
+        if (!duration(days, plan)) return fail(400, "months must be 1..120 (or days 1..3650)");
+        if (!explicit_plan.empty()) plan = explicit_plan;
+        // Extending adds to whatever is left: paying early must never lose days.
+        const AccessGrant current = options_.store->access_grant(parts[4]);
+        const std::int64_t base = current.expires_at > now ? current.expires_at : now;
+        const auto updated =
+            options_.store->grant_access(who, parts[4], base + days * kSecondsPerDay, plan);
+        if (!updated) return fail(status_for(updated.error().code()), updated.error().message());
+        return json(200, user_json(*updated, now));
+      }
+      // POST /api/v1/admin/users/{id}/revoke -> immediate lockout
+      if (parts.size() == 6 && request.method == "POST" && parts[5] == "revoke") {
+        const Status status = options_.store->revoke_access(who, parts[4]);
+        if (!status) return fail(status_for(status.code()), status.message());
+        return json(204, "");
+      }
+    }
+    return problem(404, "Not Found", "not_found");
   }
 
   if (resource == "devices") {
@@ -280,6 +438,11 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       }
       auto peer = options_.store->create_peer(who, device_id);
       if (!peer) {
+        // Expired or revoked access is not a bad request: the client must renew.
+        // 403 + `access_expired` is what a UI keys on to show "your plan ended".
+        if (peer.error().code() == ErrorCode::kPermissionDenied) {
+          return problem(403, "Forbidden", "access_expired", peer.error().message());
+        }
         const bool missing = peer.error().code() == ErrorCode::kNotFound;
         return problem(missing ? 404 : 422, missing ? "Not Found" : "Unprocessable Entity",
                        "config_unsupported", peer.error().message());
@@ -315,7 +478,12 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       }
       if (request.method == "GET" && parts.size() == 5 && parts[4] == "config") {
         auto conf = options_.store->render_client_conf(who, peer_id);
-        if (!conf) return problem(404, "Not Found", "not_found", conf.error().message());
+        if (!conf) {
+          if (conf.error().code() == ErrorCode::kPermissionDenied) {
+            return problem(403, "Forbidden", "access_expired", conf.error().message());
+          }
+          return problem(404, "Not Found", "not_found", conf.error().message());
+        }
         return text(200, *conf);
       }
       if (request.method == "DELETE" && parts.size() == 4) {

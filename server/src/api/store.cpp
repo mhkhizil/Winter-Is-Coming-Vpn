@@ -140,6 +140,13 @@ void Store::replay(const std::string& content) {
       users_[principal.user_id] = principal;
       user_email_to_id_[f[3]] = principal.user_id;
       password_hashes_[principal.user_id] = f[4];
+    } else if (kind == "E" && f.size() >= 5) {
+      // Entitlement: who may use the service, until when.
+      AccessGrant grant;
+      grant.expires_at = std::atoll(f[2].c_str());
+      grant.plan = f[3];
+      grant.status = f[4];
+      access_[f[1]] = grant;
     } else if (kind == "T" && f.size() >= 4) {
       token_to_user_[f[1]] = f[2];
       token_expiry_[f[1]] = std::atoll(f[3].c_str());
@@ -224,6 +231,11 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
     const Principal& principal = entry.second;
     (void)store->append_line("U\t" + id + "\t" + principal.tenant_id + "\t" + email_by_id[id] +
                              "\t" + store->password_hashes_[id] + "\t" + principal.role);
+  }
+  for (const auto& entry : store->access_) {
+    (void)store->append_line("E\t" + entry.first + "\t" +
+                             std::to_string(entry.second.expires_at) + "\t" + entry.second.plan +
+                             "\t" + entry.second.status);
   }
   for (const auto& entry : store->token_to_user_) {
     const std::int64_t expiry = store->token_expiry_[entry.first];
@@ -481,6 +493,12 @@ std::string base64_of_hex(const std::string& hex) {
 
 Result<Peer> Store::create_peer(const Principal& principal, std::string_view device_id) {
   const std::lock_guard<std::mutex> lock(mutex_);
+  // Access check first: an expired or revoked account must not be able to obtain
+  // a working configuration, and must not consume an address from the pool.
+  if (!access_active_locked(principal.user_id)) {
+    return make_error(ErrorCode::kPermissionDenied,
+                      "access expired or revoked: an administrator must extend it");
+  }
   const auto device_it = devices_.find(std::string{device_id});
   if (device_it == devices_.end() || device_it->second.user_id != principal.user_id) {
     return make_error(ErrorCode::kNotFound, "no such device");
@@ -572,6 +590,10 @@ Result<std::string> Store::render_client_conf(const Principal& principal,
   if (it->second.status != "active") {
     return make_error(ErrorCode::kPermissionDenied, "peer is revoked");
   }
+  if (!access_active_locked(principal.user_id)) {
+    return make_error(ErrorCode::kPermissionDenied,
+                      "access expired or revoked: an administrator must extend it");
+  }
   if (nodes_.empty()) {
     return make_error(ErrorCode::kUnavailable, "no node registered: POST /api/v1/nodes first");
   }
@@ -594,6 +616,188 @@ Result<std::string> Store::render_client_conf(const Principal& principal,
   conf += "AllowedIPs = 0.0.0.0/0, ::/0\n";
   conf += "PersistentKeepalive = 25\n";
   return conf;
+}
+
+namespace {
+bool is_admin(const Principal& actor) noexcept { return actor.role == "admin"; }
+
+UserRecord to_record(const std::string& id, const Principal& principal, const std::string& email,
+                     const AccessGrant& access) {
+  UserRecord record;
+  record.id = id;
+  record.tenant_id = principal.tenant_id;
+  record.email = email;
+  record.role = principal.role;
+  record.access = access;
+  return record;
+}
+
+std::string email_of(const std::unordered_map<std::string, std::string>& by_email,
+                     const std::string& user_id) {
+  for (const auto& entry : by_email) {
+    if (entry.second == user_id) return entry.first;
+  }
+  return {};
+}
+}  // namespace
+
+AccessGrant Store::access_grant_locked(const std::string& user_id) const {
+  const auto it = access_.find(user_id);
+  if (it != access_.end()) return it->second;
+  // Accounts from a log written before entitlements existed have no `E` record.
+  // Treating them as never-expiring stops an upgrade from locking everyone out;
+  // an administrator can attach a window at any time.
+  AccessGrant legacy;
+  legacy.plan = "legacy";
+  legacy.expires_at = 0;
+  legacy.status = "active";
+  return legacy;
+}
+
+bool Store::access_active_locked(const std::string& user_id) const {
+  const AccessGrant grant = access_grant_locked(user_id);
+  if (grant.status != "active") return false;
+  if (grant.expires_at == 0) return true;  // staff / never-expiring account
+  return grant.expires_at > now_unix();
+}
+
+AccessGrant Store::access_grant(std::string_view user_id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return access_grant_locked(std::string{user_id});
+}
+
+bool Store::access_active(std::string_view user_id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  return access_active_locked(std::string{user_id});
+}
+
+Result<UserRecord> Store::create_user(const Principal& actor, std::string_view email,
+                                      std::string_view password, std::string_view role,
+                                      std::int64_t expires_at, std::string_view plan) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  const std::string email_key{email};
+  if (email_key.empty()) {
+    return make_error(ErrorCode::kInvalidArgument, "email is required");
+  }
+  if (password.size() < 8) {
+    return make_error(ErrorCode::kInvalidArgument, "password must be at least 8 characters");
+  }
+  if (user_email_to_id_.count(email_key) != 0) {
+    return make_error(ErrorCode::kAlreadyExists, "user already exists");
+  }
+  std::string role_str{role};
+  if (role_str.empty()) role_str = "user";
+  if (role_str != "user" && role_str != "admin" && role_str != "owner") {
+    return make_error(ErrorCode::kInvalidArgument, "role must be user, admin or owner");
+  }
+
+  Principal principal;
+  principal.user_id = random_id("usr_");
+  principal.tenant_id = actor.tenant_id.empty() ? std::string{"ten_default"} : actor.tenant_id;
+  principal.role = role_str;
+  if (principal.user_id.size() <= 4) {
+    return make_error(ErrorCode::kInternal, "OS random source failed");
+  }
+  const std::string hash = hash_password(password);
+  Status appended = append_line("U\t" + principal.user_id + "\t" + principal.tenant_id + "\t" +
+                                email_key + "\t" + hash + "\t" + principal.role);
+  if (!appended) return appended;
+
+  AccessGrant grant;
+  // Administrators are staff: they never pay and must not be able to lock
+  // themselves out of the console.
+  if (role_str == "admin") {
+    grant.expires_at = 0;
+    grant.plan = "staff";
+  } else {
+    grant.expires_at = expires_at;
+    grant.plan = plan.empty() ? std::string{"trial"} : std::string{plan};
+  }
+  grant.status = "active";
+  grant.granted_at = now_unix();
+  appended = append_line("E\t" + principal.user_id + "\t" + std::to_string(grant.expires_at) +
+                         "\t" + grant.plan + "\t" + grant.status);
+  if (!appended) return appended;
+
+  users_[principal.user_id] = principal;
+  user_email_to_id_[email_key] = principal.user_id;
+  password_hashes_[principal.user_id] = hash;
+  access_[principal.user_id] = grant;
+  return to_record(principal.user_id, principal, email_key, grant);
+}
+
+Result<std::vector<UserRecord>> Store::list_users(const Principal& actor) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  std::vector<UserRecord> out;
+  out.reserve(users_.size());
+  for (const auto& entry : users_) {
+    const Principal& principal = entry.second;
+    out.push_back(to_record(principal.user_id, principal,
+                            email_of(user_email_to_id_, principal.user_id),
+                            access_grant_locked(principal.user_id)));
+  }
+  return out;
+}
+
+Result<UserRecord> Store::get_user(const Principal& actor, std::string_view user_id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  const auto it = users_.find(std::string{user_id});
+  if (it == users_.end()) return make_error(ErrorCode::kNotFound, "no such user");
+  return to_record(it->first, it->second, email_of(user_email_to_id_, it->first),
+                   access_grant_locked(it->first));
+}
+
+Result<UserRecord> Store::grant_access(const Principal& actor, std::string_view user_id,
+                                       std::int64_t expires_at, std::string_view plan) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  const auto it = users_.find(std::string{user_id});
+  if (it == users_.end()) return make_error(ErrorCode::kNotFound, "no such user");
+  if (expires_at < 0) {
+    return make_error(ErrorCode::kInvalidArgument, "expires_at must be a unix timestamp");
+  }
+  AccessGrant grant;
+  grant.expires_at = expires_at;
+  grant.plan = plan.empty() ? std::string{"custom"} : std::string{plan};
+  grant.status = "active";  // granting also re-enables a revoked account
+  grant.granted_at = now_unix();
+  const Status appended = append_line("E\t" + it->first + "\t" + std::to_string(grant.expires_at) +
+                                      "\t" + grant.plan + "\t" + grant.status);
+  if (!appended) return make_error(appended.code(), appended.message());
+  access_[it->first] = grant;
+  return to_record(it->first, it->second, email_of(user_email_to_id_, it->first), grant);
+}
+
+Status Store::revoke_access(const Principal& actor, std::string_view user_id) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return Status{ErrorCode::kPermissionDenied, "administrator role required"};
+  }
+  const auto it = users_.find(std::string{user_id});
+  if (it == users_.end()) return Status{ErrorCode::kNotFound, "no such user"};
+  if (it->first == actor.user_id) {
+    // An administrator revoking themselves would be a one-way door.
+    return Status{ErrorCode::kInvalidArgument, "cannot revoke your own access"};
+  }
+  AccessGrant grant = access_grant_locked(it->first);
+  grant.status = "disabled";
+  grant.granted_at = now_unix();
+  const Status appended = append_line("E\t" + it->first + "\t" + std::to_string(grant.expires_at) +
+                                      "\t" + grant.plan + "\t" + grant.status);
+  if (!appended) return appended;
+  access_[it->first] = grant;
+  return Status{};
 }
 
 }  // namespace vpn::api

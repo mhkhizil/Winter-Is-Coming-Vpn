@@ -17,7 +17,8 @@ tunnel). The one unproven link is interop with the *official* WireGuard client: 
 | Interop with the official `wg-quick` client | **NOT verified** | run `scripts/interop-test.sh` on Linux |
 | TLS termination | **done (proxy contract)** | `tls.terminated_by_proxy` + `require_https` + HSTS + trusted-proxy CIDRs; nginx/Caddy configs; ADR-0009 |
 | `vpnctl` | **done** | `server/cli/main.cpp` |
-| PostgreSQL adapter, gRPC CP->DP, billing | not implemented | next increments |
+| Access control (admin-granted, manual payment) | **done** | ADR-0010; `vpnctl admin …`; enforced in CP and DP |
+| PostgreSQL adapter, gRPC CP->DP | not implemented | next increments |
 
 ## Original milestone plan
 

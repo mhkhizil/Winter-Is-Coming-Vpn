@@ -111,3 +111,50 @@ Errors: `401 unauthenticated`, `403 device_revoked`, `409 session_exists`,
    the caller's **and** the peer was created in `server` key mode.
 4. No endpoint returns another user's email, device name, or IP.
 5. Admin impersonation always writes an `audit_log` row with `impersonator_id`.
+
+## Administration: accounts and paid access (implemented)
+
+Access is sold in months and paid for out of band; an administrator records the
+result. See [ADR-0010](DECISIONS/ADR-0010-admin-granted-access.md). All of these
+require a token whose account has `role = "admin"`; anything else gets
+`403 permission_denied`.
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/v1/admin/users` | `{"email","password","months"\|"days","role"?,"plan"?}` | Creates the account **and** its access window. `months` are 30-day months; default is 1 month. `role` is `user` (default), `admin` or `owner`; administrators never expire. Returns the account with `days_left`. |
+| GET | `/api/v1/admin/users` | — | `{"data":[…]}` of every account: `id`, `email`, `role`, `plan`, `status`, `expires_at`, `days_left`. |
+| GET | `/api/v1/admin/users/{id}` | — | One account. |
+| POST | `/api/v1/admin/users/{id}/access` | `{"months"\|"days","plan"?}` | **Extends**: adds to `max(now, current expiry)`, so paying early never loses days. Also re-enables a revoked account. |
+| POST | `/api/v1/admin/users/{id}/revoke` | — | `204`. Immediate lockout; the record and window are kept. An administrator cannot revoke themselves. |
+
+`status` is derived, not stored as such:
+`active` → `expired` when `expires_at` has passed, or `disabled` after a revoke.
+
+### What expiry actually does
+
+| Surface | Behaviour |
+|---|---|
+| `POST /api/v1/peers` | `403 access_expired` — no new peer can be allocated |
+| `GET /api/v1/peers/{id}/config` | `403 access_expired` — the configuration cannot be re-downloaded |
+| `GET /api/v1/me` | still available: the user must be able to see that the plan ended |
+| Login | still available, for the same reason |
+| Data plane (`vpn-dp`) | handshake refused, transport packets dropped — an **already installed** client stops passing traffic |
+
+`vpnctl` mirrors these:
+
+```
+vpnctl admin users add --email ali@example.invalid --password <pw> --months 6
+vpnctl admin users                      # id, email, plan, status, days left
+vpnctl admin grant <user-id> --months 1 # extend by one month
+vpnctl admin revoke <user-id>           # immediate lockout
+vpnctl me                               # plan, status, days left (as the customer)
+```
+
+### Operator runbook
+
+1. Money arrives out of band. Note the email and the plan.
+2. `vpnctl admin users add --email … --months 6 --password <initial>` for a new
+   customer, or `vpnctl admin grant <user-id> --months 6` for a renewal.
+3. `vpnctl admin users` weekly: anyone with a small `days_left` gets a reminder.
+4. Non-payment: `vpnctl admin revoke <user-id>` — the tunnel drops immediately.
+

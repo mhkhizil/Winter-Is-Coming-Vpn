@@ -63,6 +63,27 @@ struct NodeInfo {
   std::string public_key_hex{};
 };
 
+// Access grant: this is how money turns into service.
+//
+// Payment is collected out of band (bank transfer, cash, mobile money - whatever
+// the operator uses) and an administrator records the outcome here: who, until
+// when, on which plan. No payment processor, no webhooks, no card data, and
+// therefore no PCI scope (see ADR-0010).
+struct AccessGrant {
+  std::int64_t expires_at{0};     // unix seconds; 0 means "never expires" (staff)
+  std::string plan{"trial"};      // free-form: trial | 1m | 6m | 12m | staff
+  std::string status{"active"};   // active | disabled (revoked by an administrator)
+  std::int64_t granted_at{0};     // unix seconds
+};
+
+struct UserRecord {
+  std::string id{};
+  std::string tenant_id{};
+  std::string email{};
+  std::string role{"user"};
+  AccessGrant access{};
+};
+
 struct StoreOptions {
   std::string path{};            // e.g. /var/lib/vpn/control.log
   std::string endpoint_host{};   // advertised node host in client configs
@@ -89,6 +110,29 @@ class Store {
   [[nodiscard]] Status revoke_token(std::string_view token);
   [[nodiscard]] Status add_user(std::string_view email, std::string_view password,
                                 std::string_view role);
+
+  // --- administration: accounts and paid access ------------------------------
+  // Every method below requires the actor's role to be "admin". They are the only
+  // way to attach an expiry to an account, and expiry is what makes the VPN stop
+  // working for a customer whose month (or six) has run out.
+  [[nodiscard]] Result<UserRecord> create_user(const Principal& actor, std::string_view email,
+                                               std::string_view password, std::string_view role,
+                                               std::int64_t expires_at, std::string_view plan);
+  [[nodiscard]] Result<std::vector<UserRecord>> list_users(const Principal& actor) const;
+  [[nodiscard]] Result<UserRecord> get_user(const Principal& actor, std::string_view user_id) const;
+
+  // Sets (or replaces) the access window. Extending is the common case: pass the
+  // new absolute expiry, computed by the caller from the plan length.
+  [[nodiscard]] Result<UserRecord> grant_access(const Principal& actor, std::string_view user_id,
+                                                std::int64_t expires_at, std::string_view plan);
+  // Immediate lockout that keeps the record (so the operator can see it and
+  // re-enable later). Deletes nothing.
+  [[nodiscard]] Status revoke_access(const Principal& actor, std::string_view user_id);
+
+  // "Can this account create peers / fetch configurations right now?"
+  // A missing grant means a legacy or staff account and is treated as active.
+  [[nodiscard]] bool access_active(std::string_view user_id) const;
+  [[nodiscard]] AccessGrant access_grant(std::string_view user_id) const;
 
   // --- devices --------------------------------------------------------------
   [[nodiscard]] Result<Device> create_device(const Principal& principal, std::string_view name,
@@ -118,6 +162,8 @@ class Store {
   [[nodiscard]] std::size_t peer_count() const;
 
  private:
+  [[nodiscard]] bool access_active_locked(const std::string& user_id) const;
+  [[nodiscard]] AccessGrant access_grant_locked(const std::string& user_id) const;
   [[nodiscard]] Status append_line(const std::string& line);
   void replay(const std::string& content);
   [[nodiscard]] bool ip_taken(std::string_view ipv4) const;
@@ -136,6 +182,7 @@ class Store {
   std::unordered_map<std::string, Device> devices_;
   std::unordered_map<std::string, Peer> peers_;
   std::vector<NodeInfo> nodes_;
+  std::unordered_map<std::string, AccessGrant> access_;
 };
 
 }  // namespace vpn::api

@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <ctime>
 #include <string>
 #include <vector>
 
@@ -83,6 +84,11 @@ struct PeerConfig {
   std::string name{};
   vpn::crypto::X25519PublicKey public_key{};
   std::vector<AllowedPrefix> allowed{};
+  // 0 = never expires. Otherwise a unix timestamp: when paid access lapses the
+  // handshake is refused and transport packets are dropped, so a client that
+  // still has its configuration stops working the moment the subscription ends
+  // (ADR-0010). The control plane is the source of truth for this value.
+  std::int64_t expires_at{0};
 };
 
 struct Config {
@@ -94,6 +100,9 @@ struct Config {
   std::uint16_t mtu{1420};
   std::vector<PeerConfig> peers{};
 };
+
+// Unix seconds. Used only for access expiry checks.
+std::int64_t unix_now() noexcept { return static_cast<std::int64_t>(std::time(nullptr)); }
 
 std::string trim(const std::string& s) {
   std::size_t b = s.find_first_not_of(" \t\r\n");
@@ -186,6 +195,9 @@ vpn::Result<Config> load_config(const std::string& path) {
           return vpn::make_error(vpn::ErrorCode::kInvalidArgument,
                                  "public_key must be 64 hex characters");
         }
+      } else if (key == "expires_at") {
+        // Unix seconds. Absent or 0 means "never expires" (staff / trial-less).
+        current.expires_at = static_cast<std::int64_t>(std::strtoll(value.c_str(), nullptr, 10));
       } else if (key == "allowed_ips") {
         // TOML array: ["10.66.0.1/32"] (or a bare comma-separated list).
         std::string list = value;
@@ -387,6 +399,8 @@ struct Statistics {
   std::uint64_t transport_in{0};
   std::uint64_t transport_out{0};
   std::uint64_t dropped{0};
+  // Packets refused because the peer's paid access lapsed (ADR-0010).
+  std::uint64_t transport_dropped{0};
 };
 
 void print_usage() {
@@ -568,6 +582,15 @@ int main(int argc, char** argv) {
             }
           }
           if (owner != nullptr) {
+            // Paid access lapses on the server side, not on the client's honour:
+            // an already-installed client gets its handshake refused, so the
+            // tunnel cannot outlive the subscription (ADR-0010).
+            if (owner->config.expires_at != 0 && owner->config.expires_at <= unix_now()) {
+              ++stats.handshakes_rejected;
+              std::printf("peer %s rejected: access expired\n", owner->config.name.c_str());
+              std::fflush(stdout);
+              continue;
+            }
             Byte response[128];
             if (responder->create_response(MutableByteSpan{response, sizeof(response)})) {
               (void)::sendto(socket.fd, reinterpret_cast<const char*>(response),
@@ -593,6 +616,12 @@ int main(int argc, char** argv) {
           const std::uint32_t index = header->transport.receiver_index;
           for (Peer& peer : peers) {
             if (!peer.established || peer.session.local_index() != index) continue;
+            // Drop traffic from a lapsed peer even if the session was set up
+            // before it expired.
+            if (peer.config.expires_at != 0 && peer.config.expires_at <= unix_now()) {
+              ++stats.transport_dropped;
+              continue;
+            }
             auto opened = peer.session.open(MutableByteSpan{datagram, packet.size()});
             if (!opened) break;
             ++stats.transport_in;

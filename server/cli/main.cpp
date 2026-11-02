@@ -218,6 +218,20 @@ struct Reply {
   return out;
 }
 
+// Numeric (unquoted) JSON field, e.g. "days_left":12.
+[[nodiscard]] std::string json_number(const std::string& body, std::string_view key) {
+  const std::string needle = "\"" + std::string{key} + "\":";
+  const std::size_t at = body.find(needle);
+  if (at == std::string::npos) return {};
+  std::size_t i = at + needle.size();
+  std::string out;
+  while (i < body.size() && (body[i] == '-' || (body[i] >= '0' && body[i] <= '9'))) {
+    out.push_back(body[i]);
+    ++i;
+  }
+  return out;
+}
+
 // --- token storage ---------------------------------------------------------
 
 [[nodiscard]] std::string token_path() {
@@ -376,10 +390,14 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape)
   if (command == "me") {
     const Reply reply = get("/api/v1/me");
     if (reply.status != 200) return fail(reply);
-    std::printf("user    %s\ntenant  %s\nrole    %s\n",
+    const std::string access = reply.body.substr(reply.body.find("\"access\":") == std::string::npos
+                                                     ? 0
+                                                     : reply.body.find("\"access\":"));
+    std::printf("user    %s\ntenant  %s\nrole    %s\nplan    %s\nstatus  %s\nleft    %s days\n",
                 json_string(reply.body, "user_id").c_str(),
                 json_string(reply.body, "tenant_id").c_str(),
-                json_string(reply.body, "role").c_str());
+                json_string(reply.body, "role").c_str(), json_string(access, "plan").c_str(),
+                json_string(access, "status").c_str(), json_number(access, "days_left").c_str());
     return 0;
   }
 
@@ -463,6 +481,106 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape)
     if (reply.status != 200) return fail(reply);
     std::printf("%s", reply.body.c_str());
     return 0;
+  }
+
+  if (command == "admin") {
+    const std::string action = positional(argc, argv, 1);
+    const std::string sub = positional(argc, argv, 2);
+
+    // Shared: {"months":N} or {"days":N}
+    const auto duration_body = [&]() {
+      std::string body = "{";
+      const std::string months = arg_value(argc, argv, "--months");
+      const std::string days = arg_value(argc, argv, "--days");
+      const std::string plan = arg_value(argc, argv, "--plan");
+      bool first = true;
+      if (!months.empty()) {
+        body += "\"months\":" + months;
+        first = false;
+      } else if (!days.empty()) {
+        body += "\"days\":" + days;
+        first = false;
+      }
+      if (!plan.empty()) {
+        if (!first) body += ',';
+        body += "\"plan\":\"" + plan + "\"";
+      }
+      body += "}";
+      return body;
+    };
+
+    if (action == "users" && sub == "add") {
+      const std::string email = arg_value(argc, argv, "--email");
+      const std::string password = arg_value(argc, argv, "--password");
+      if (email.empty() || password.empty()) {
+        std::fprintf(stderr,
+                     "error: usage: vpnctl admin users add --email <e> --password <p> "
+                     "[--months N | --days N] [--role user]\n");
+        return 2;
+      }
+      std::string body = "{\"email\":\"" + email + "\",\"password\":\"" + password + "\"";
+      const std::string role = arg_value(argc, argv, "--role");
+      if (!role.empty()) body += ",\"role\":\"" + role + "\"";
+      const std::string months = arg_value(argc, argv, "--months");
+      const std::string days = arg_value(argc, argv, "--days");
+      const std::string plan = arg_value(argc, argv, "--plan");
+      if (!months.empty()) body += ",\"months\":" + months;
+      if (!days.empty()) body += ",\"days\":" + days;
+      if (!plan.empty()) body += ",\"plan\":\"" + plan + "\"";
+      body += "}";
+      const Reply reply = http_request(url, "POST", "/api/v1/admin/users", token, body);
+      if (reply.status != 201) return fail(reply);
+      std::printf("%s\n", reply.body.c_str());
+      return 0;
+    }
+
+    if (action == "users" && sub.empty()) {
+      const Reply reply = get("/api/v1/admin/users");
+      if (reply.status != 200) return fail(reply);
+      const std::string body = reply.body;
+      // One line per account: id, email, plan, status, days left, expiry.
+      std::size_t pos = 0;
+      while ((pos = body.find("\"email\":\"", pos)) != std::string::npos) {
+        const std::size_t start = pos == 0 ? 0 : body.rfind('{', pos);
+        const std::size_t end = body.find('}', pos);
+        if (end == std::string::npos) break;
+        const std::string record = body.substr(start == std::string::npos ? pos : start,
+                                               end - (start == std::string::npos ? pos : start) + 1);
+        std::printf("%-34s %-28s %-6s %-9s %4s days left\n",
+                    json_string(record, "id").c_str(), json_string(record, "email").c_str(),
+                    json_string(record, "plan").c_str(), json_string(record, "status").c_str(),
+                    json_number(record, "days_left").c_str());
+        pos = end;
+      }
+      return 0;
+    }
+
+    if ((action == "grant" || action == "extend") && !sub.empty()) {
+      const Reply reply = http_request(url, "POST", "/api/v1/admin/users/" + sub + "/access", token,
+                                      duration_body());
+      if (reply.status != 200) return fail(reply);
+      std::printf("extended: %s now expires (%s, %s days left)\n",
+                  json_string(reply.body, "email").c_str(),
+                  json_string(reply.body, "plan").c_str(),
+                  json_number(reply.body, "days_left").c_str());
+      return 0;
+    }
+
+    if (action == "revoke" && !sub.empty()) {
+      const Reply reply = http_request(url, "POST", "/api/v1/admin/users/" + sub + "/revoke", token,
+                                      "{}");
+      if (reply.status != 204 && reply.status != 200) return fail(reply);
+      std::printf("access revoked for %s\n", sub.c_str());
+      return 0;
+    }
+
+    std::fprintf(stderr,
+                 "error: usage:\n"
+                 "  vpnctl admin users add --email <e> --password <p> [--months N|--days N]\n"
+                 "  vpnctl admin users\n"
+                 "  vpnctl admin grant <user-id> [--months N|--days N]\n"
+                 "  vpnctl admin revoke <user-id>\n");
+    return 2;
   }
 
   if (command == "nodes") {
