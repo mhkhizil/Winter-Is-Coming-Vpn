@@ -251,44 +251,61 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
   }
   store->log_ = rewrite;
   store->skip_fsync_ = true;
+
+  // Every append is checked. If a write fails (disk full, quota, I/O error) the
+  // compaction file is truncated, and renaming it over the live log would silently
+  // destroy state - worse than failing to start. So: record the first failure,
+  // discard the temporary file, and fail loudly.
+  bool wrote = true;
+  const auto emit = [&](const std::string& line) {
+    if (wrote && !store->append_line(line).ok()) wrote = false;
+  };
+
   for (const auto& entry : store->users_) {
     const std::string& id = entry.first;
     const Principal& principal = entry.second;
-    (void)store->append_line("U\t" + id + "\t" + principal.tenant_id + "\t" + email_by_id[id] +
-                             "\t" + store->password_hashes_[id] + "\t" + principal.role);
+    emit("U\t" + id + "\t" + principal.tenant_id + "\t" + email_by_id[id] + "\t" +
+         store->password_hashes_[id] + "\t" + principal.role);
   }
   for (const auto& entry : store->access_) {
-    (void)store->append_line("E\t" + entry.first + "\t" +
-                             std::to_string(entry.second.expires_at) + "\t" + entry.second.plan +
-                             "\t" + entry.second.status);
+    emit("E\t" + entry.first + "\t" + std::to_string(entry.second.expires_at) + "\t" +
+         entry.second.plan + "\t" + entry.second.status);
   }
   for (const auto& entry : store->reminders_) {
     const std::size_t bar = entry.first.find('|');
     if (bar == std::string::npos) continue;
-    (void)store->append_line("R\t" + entry.first.substr(0, bar) + "\t" +
-                             entry.first.substr(bar + 1) + "\t" +
-                             std::to_string(entry.second));
+    emit("R\t" + entry.first.substr(0, bar) + "\t" + entry.first.substr(bar + 1) + "\t" +
+         std::to_string(entry.second));
   }
   for (const auto& entry : store->token_to_user_) {
     const std::int64_t expiry = store->token_expiry_[entry.first];
     if (expiry > now_unix()) {
-      (void)store->append_line("T\t" + entry.first + "\t" + entry.second + "\t" +
-                               std::to_string(expiry));
+      emit("T\t" + entry.first + "\t" + entry.second + "\t" + std::to_string(expiry));
     }
   }
   for (const auto& entry : store->devices_) {
     const Device& device = entry.second;
-    (void)store->append_line("D\t" + device.id + "\t" + device.user_id + "\t" + device.name +
-                             "\t" + device.platform + "\t" + device.public_key_hex);
+    emit("D\t" + device.id + "\t" + device.user_id + "\t" + device.name + "\t" +
+         device.platform + "\t" + device.public_key_hex);
   }
   for (const auto& entry : store->peers_) {
     const Peer& peer = entry.second;
-    (void)store->append_line("P\t" + peer.id + "\t" + peer.device_id + "\t" + peer.public_key_hex +
-                             "\t" + peer.ipv4 + "\t" + peer.ipv6 + "\t" + peer.status);
+    emit("P\t" + peer.id + "\t" + peer.device_id + "\t" + peer.public_key_hex + "\t" +
+         peer.ipv4 + "\t" + peer.ipv6 + "\t" + peer.status);
   }
   for (const NodeInfo& node : store->nodes_) {
-    (void)store->append_line("S\t" + node.id + "\t" + node.region + "\t" + node.host + "\t" +
-                             std::to_string(node.port) + "\t" + node.public_key_hex);
+    emit("S\t" + node.id + "\t" + node.region + "\t" + node.host + "\t" +
+         std::to_string(node.port) + "\t" + node.public_key_hex);
+  }
+
+  if (!wrote) {
+    std::fclose(rewrite);
+    store->log_ = nullptr;
+    store->skip_fsync_ = false;
+    std::error_code ignored;
+    std::filesystem::remove(compaction_path, ignored);
+    return make_error(ErrorCode::kUnavailable,
+                      "cannot rewrite the store log (out of space?); previous log kept");
   }
   // One flush + one fsync for the whole rewrite, then an atomic replace.
   if (std::fflush(rewrite) != 0) {

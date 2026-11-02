@@ -791,6 +791,15 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
       declared_content_length(std::string_view{buffer}.substr(0, body_offset));
   if (content_length > 0 && content_length <= kMaxRequestBody) {
     while (buffer.size() < body_offset + content_length) {
+      // Same absolute deadline as the header block. Without it, a client could
+      // announce 8 KiB and then dribble one byte per receive-timeout, pinning a
+      // worker thread for minutes; 64 such clients and the API is unreachable.
+      if (std::chrono::steady_clock::now() >= deadline) {
+        send_problem(fd, 408, "Request Timeout");
+        health_.requests_rejected.fetch_add(1, std::memory_order_relaxed);
+        shutdown_send(fd);
+        return;
+      }
       const IoResult got = ::recv(fd, chunk, static_cast<IoSize>(sizeof(chunk)), 0);
       if (got <= 0) break;
       buffer.append(chunk, static_cast<std::size_t>(got));

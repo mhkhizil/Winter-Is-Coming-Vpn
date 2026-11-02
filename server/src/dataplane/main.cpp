@@ -19,6 +19,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include "vpn/common/bytes.hpp"
@@ -680,7 +681,20 @@ int main(int argc, char** argv) {
   std::signal(SIGHUP, on_sighup);
 #endif
 
+  // Session index -> position in `peers`. Without it the transport path scanned
+  // every peer for every packet, which is the difference between O(1) and O(peers)
+  // per packet on the hot path. Rebuilt whenever the table or a session changes;
+  // handshakes are rare, packets are not.
   std::vector<Peer> peers;
+  std::unordered_map<std::uint32_t, std::size_t> peer_by_index;
+  const auto rebuild_index = [&peers, &peer_by_index]() {
+    peer_by_index.clear();
+    for (std::size_t i = 0; i < peers.size(); ++i) {
+      if (peers[i].established) {
+        peer_by_index[peers[i].session.local_index()] = i;
+      }
+    }
+  };
   peers.reserve(cfg.peers.size());
   for (const PeerConfig& pc : cfg.peers) {
     Peer peer;
@@ -760,6 +774,7 @@ int main(int argc, char** argv) {
           updated.push_back(peer);
         }
         peers.swap(updated);
+        rebuild_index();  // positions changed; indices must follow
         std::printf("configuration reloaded: %zu peer(s)\n", peers.size());
       }
     }
@@ -808,6 +823,7 @@ int main(int argc, char** argv) {
                 owner->endpoint = from;
                 owner->endpoint_len = static_cast<int>(from_len);
                 owner->established = true;
+                rebuild_index();  // the new session index must be findable
                 ++stats.handshakes_ok;
                 std::printf("peer %s established (local index %u)\n",
                             owner->config.name.c_str(), owner->session.local_index());
@@ -822,8 +838,16 @@ int main(int argc, char** argv) {
 
         if (header && header->type == vpn::wire::MessageType::kTransportData) {
           const std::uint32_t index = header->transport.receiver_index;
-          for (Peer& peer : peers) {
-            if (!peer.established || peer.session.local_index() != index) continue;
+          // O(1) session lookup. This used to scan every peer for every packet:
+          // at 5k peers and 100k pps that is 5e8 session-index comparisons per
+          // second, purely to discard packets that are not ours.
+          const auto mapped = peer_by_index.find(index);
+          if (mapped == peer_by_index.end()) {
+            ++stats.dropped;  // no session with that index
+            continue;
+          }
+          Peer& peer = peers[mapped->second];
+          {
             // Drop traffic from a lapsed peer even if the session was set up
             // before it expired.
             if (peer.config.expires_at != 0 && peer.config.expires_at <= unix_now()) {
@@ -831,7 +855,7 @@ int main(int argc, char** argv) {
               continue;
             }
             auto opened = peer.session.open(MutableByteSpan{datagram, packet.size()});
-            if (!opened) break;
+            if (!opened) continue;
             ++stats.transport_in;
             ++peer.rx_packets;
             if (peer.rx_packets == 1) {
@@ -844,7 +868,6 @@ int main(int argc, char** argv) {
             peer.endpoint = from;  // authenticated: safe to follow the peer
             peer.endpoint_len = static_cast<int>(from_len);
             if (!opened->empty() && tun.available()) (void)tun.write_packet(*opened);
-            break;
           }
           continue;
         }
