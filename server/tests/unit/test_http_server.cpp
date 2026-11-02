@@ -23,6 +23,7 @@
 #include <ws2tcpip.h>
 using TestSocket = SOCKET;
 constexpr TestSocket kNoSocket = INVALID_SOCKET;
+using SocketLength = int;  // Winsock send/recv take an int
 #else
 #include <arpa/inet.h>
 #include <netinet/in.h>
@@ -30,6 +31,7 @@ constexpr TestSocket kNoSocket = INVALID_SOCKET;
 #include <unistd.h>
 using TestSocket = int;
 constexpr TestSocket kNoSocket = -1;
+using SocketLength = std::size_t;  // POSIX send/recv take a size_t
 #endif
 
 namespace {
@@ -78,7 +80,7 @@ class TestClient {
   bool send(std::string_view data) {
     std::size_t sent = 0;
     while (sent < data.size()) {
-      const auto n = ::send(fd_, data.data() + sent, static_cast<int>(data.size() - sent), 0);
+      const auto n = ::send(fd_, data.data() + sent, static_cast<SocketLength>(data.size() - sent), 0);
       if (n <= 0) return false;
       sent += static_cast<std::size_t>(n);
     }
@@ -89,7 +91,7 @@ class TestClient {
     std::string out;
     char buf[1024];
     while (true) {
-      const auto n = ::recv(fd_, buf, static_cast<int>(sizeof(buf)), 0);
+      const auto n = ::recv(fd_, buf, static_cast<SocketLength>(sizeof(buf)), 0);
       if (n <= 0) break;
       out.append(buf, static_cast<std::size_t>(n));
     }
