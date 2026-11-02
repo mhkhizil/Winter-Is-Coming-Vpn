@@ -160,6 +160,27 @@ Result<ServerConfig> parse(std::string_view text) {
       if (!parse_bool(value, cfg.tls.hsts)) return fail("expected a boolean");
     } else if (qualified == "tls.hsts_max_age_secs") {
       if (!parse_u32(value, cfg.tls.hsts_max_age_secs)) return fail("expected a number");
+    } else if (qualified == "smtp.host") {
+      cfg.smtp.host = value;
+    } else if (qualified == "smtp.port") {
+      std::uint32_t v = 0;
+      if (!parse_u32(value, v) || v == 0 || v > 65535) return fail("expected a port");
+      cfg.smtp.port = static_cast<std::uint16_t>(v);
+    } else if (qualified == "smtp.from") {
+      cfg.smtp.from = value;
+    } else if (qualified == "smtp.username") {
+      cfg.smtp.username = value;
+    } else if (qualified == "smtp.password") {
+      cfg.smtp.password = value;
+    } else if (qualified == "smtp.dry_run") {
+      if (!parse_bool(value, cfg.smtp.dry_run)) return fail("expected a boolean");
+    } else if (qualified == "smtp.reminder_days") {
+      cfg.smtp.reminder_days.clear();
+      for (const std::string& item : parse_string_list(value)) {
+        const long days = std::strtol(item.c_str(), nullptr, 10);
+        if (days < 1 || days > 365) return fail("reminder_days must be 1..365");
+        cfg.smtp.reminder_days.push_back(static_cast<std::uint32_t>(days));
+      }
     } else if (qualified == "tls.trusted_proxies") {
       cfg.tls.trusted_proxies = parse_string_list(value);
     } else if (qualified == "rate_limit.requests_per_second") {
@@ -217,6 +238,20 @@ Status apply_environment(ServerConfig& cfg) {
     bool parsed = false;
     if (parse_bool(v, parsed)) cfg.tls.hsts = parsed;
   }
+  if (const char* v = env("VPN_SMTP_HOST")) cfg.smtp.host = v;
+  if (const char* v = env("VPN_SMTP_FROM")) cfg.smtp.from = v;
+  if (const char* v = env("VPN_SMTP_USERNAME")) cfg.smtp.username = v;
+  if (const char* v = env("VPN_SMTP_PASSWORD")) cfg.smtp.password = v;
+  if (const char* v = env("VPN_SMTP_PORT")) {
+    std::uint32_t port = 0;
+    if (parse_u32(v, port) && port > 0 && port <= 65535) {
+      cfg.smtp.port = static_cast<std::uint16_t>(port);
+    }
+  }
+  if (const char* v = env("VPN_SMTP_DRY_RUN")) {
+    bool parsed = false;
+    if (parse_bool(v, parsed)) cfg.smtp.dry_run = parsed;
+  }
   if (const char* v = env("VPN_TLS_TRUSTED_PROXIES")) {
     cfg.tls.trusted_proxies = parse_string_list(v);
   }
@@ -244,6 +279,9 @@ Status validate(const ServerConfig& cfg) {
   if ((!cfg.tls.cert_file.empty()) != (!cfg.tls.key_file.empty())) {
     return Status{ErrorCode::kInvalidArgument,
                   "tls.cert_file and tls.key_file must be set together"};
+  }
+  if (!cfg.smtp.host.empty() && cfg.smtp.from.empty()) {
+    return Status{ErrorCode::kInvalidArgument, "smtp.from is required when smtp.host is set"};
   }
   if (cfg.tls.require_https && !cfg.tls.terminated_by_proxy) {
     return Status{ErrorCode::kInvalidArgument,

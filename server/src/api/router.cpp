@@ -8,6 +8,7 @@
 
 #include "vpn/common/bytes.hpp"
 #include "vpn/common/result_helpers.hpp"
+#include "vpn/notify/smtp.hpp"
 
 namespace vpn::api {
 namespace {
@@ -377,6 +378,14 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
         if (!updated) return fail(status_for(updated.error().code()), updated.error().message());
         return json(200, user_json(*updated, now));
       }
+      // POST /api/v1/admin/users/{id}/password {"password":"..."} -> reset
+      if (parts.size() == 6 && request.method == "POST" && parts[5] == "password") {
+        std::string next;
+        if (!field(request.body, "password", next)) return fail(400, "password is required");
+        const Status status = options_.store->reset_password(who, parts[4], next);
+        if (!status) return fail(status_for(status.code()), status.message());
+        return json(204, "");
+      }
       // POST /api/v1/admin/users/{id}/revoke -> immediate lockout
       if (parts.size() == 6 && request.method == "POST" && parts[5] == "revoke") {
         const Status status = options_.store->revoke_access(who, parts[4]);
@@ -384,7 +393,130 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
         return json(204, "");
       }
     }
+
+    // POST /api/v1/admin/reminders/run?days=7,1&dry_run=1
+    //
+    // Idempotent: an account is marked per bucket, so this can run from cron every
+    // day without spamming anyone. Query parameters (not a JSON body) because the
+    // values are plain numbers and the command is meant to be curl-able.
+    if (parts.size() >= 4 && parts[3] == "reminders") {
+      if (request.method != "POST") return problem(405, "Method Not Allowed", "not_allowed");
+      const auto query_value = [&](const char* name) -> std::string {
+        const std::string needle = std::string{name} + "=";
+        const std::size_t at = request.query.find(needle);
+        if (at == std::string::npos) return {};
+        std::size_t end = request.query.find('&', at);
+        if (end == std::string::npos) end = request.query.size();
+        return request.query.substr(at + needle.size(), end - (at + needle.size()));
+      };
+
+      std::string spec = query_value("days");
+      if (spec.empty()) spec = "7,1";
+      const bool dry_run = query_value("dry_run") == "1" || query_value("dry_run") == "true" ||
+                           options_.smtp_dry_run;
+
+      notify::SmtpConfig smtp;
+      smtp.host = options_.smtp_host;
+      smtp.port = options_.smtp_port;
+      smtp.from = options_.smtp_from;
+      smtp.username = options_.smtp_username;
+      smtp.password = options_.smtp_password;
+      smtp.dry_run = dry_run;
+      if (smtp.host.empty()) {
+        return problem(503, "Service Unavailable", "not_configured",
+                       "smtp is not configured: set [smtp] host/from in the vpnd config");
+      }
+
+      int sent = 0;
+      int failed = 0;
+      std::string detail;
+      std::size_t cursor = 0;
+      while (cursor <= spec.size()) {
+        const std::size_t comma = spec.find(',', cursor);
+        const std::string item =
+            spec.substr(cursor, comma == std::string::npos ? std::string::npos : comma - cursor);
+        cursor = comma == std::string::npos ? spec.size() + 1 : comma + 1;
+        const long days = std::strtol(item.c_str(), nullptr, 10);
+        if (days < 1 || days > 365) continue;
+        const std::string bucket = std::to_string(days) + "d";
+        const auto expiring = options_.store->accounts_expiring_within(who, days, bucket);
+        if (!expiring) return fail(status_for(expiring.error().code()), expiring.error().message());
+        for (const auto& account : *expiring) {
+          notify::Message message;
+          message.to = account.email;
+          message.subject = "Your VPN access ends in " + std::to_string(days) + " day(s)";
+          message.body = "Hello,\n\nYour VPN access (plan " + account.user.access.plan +
+                         ") ends in " + std::to_string(days) +
+                         " day(s).\n\nTo keep using the service, renew with your provider. "
+                         "Your existing configuration keeps working until then.\n";
+          const Status status = notify::send(smtp, message);
+          if (status.ok()) {
+            ++sent;
+            (void)options_.store->mark_reminder_sent(who, account.user.id, bucket);
+          } else {
+            ++failed;
+            detail += (detail.empty() ? "" : "; ") + account.email + ": " + status.message();
+          }
+        }
+      }
+      std::string body = "{\"sent\":" + std::to_string(sent) + ",\"failed\":" +
+                         std::to_string(failed) + ",\"dry_run\":" + (dry_run ? "true" : "false");
+      if (!detail.empty()) body += ",\"errors\":\"" + escape(detail) + "\"";
+      body += "}";
+      return json(failed == 0 ? 200 : 502, body);
+    }
+
     return problem(404, "Not Found", "not_found");
+  }
+
+  // GET /api/v1/dp/config?node=<id> -> the peer table a node should run, rendered
+  // as the TOML subset `vpn-dp` already parses (ADR-0011). Administrator only: it
+  // contains every peer's public key.
+  if (resource == "dp") {
+    if (who.role != "admin") {
+      return problem(403, "Forbidden", "permission_denied", "administrator role required");
+    }
+    if (!(parts.size() >= 4 && parts[3] == "config") || request.method != "GET") {
+      return problem(404, "Not Found", "not_found");
+    }
+    std::string node;
+    const std::size_t at = request.query.find("node=");
+    if (at != std::string::npos) {
+      std::size_t end = request.query.find('&', at);
+      if (end == std::string::npos) end = request.query.size();
+      node = request.query.substr(at + 5, end - (at + 5));
+    }
+    const auto rendered = options_.store->render_dp_config(who, node);
+    if (!rendered) {
+      return problem(status_for(rendered.error().code()),
+                     rendered.error().code() == ErrorCode::kUnavailable ? "Service Unavailable"
+                                                                       : "Internal Server Error",
+                     "internal", rendered.error().message());
+    }
+    return text(200, *rendered);
+  }
+
+  if (resource == "me" && request.method == "POST" && parts.size() >= 4 && parts[3] == "password") {
+    std::string current;
+    std::string next;
+    if (!field(request.body, "current_password", current) ||
+        !field(request.body, "new_password", next)) {
+      return problem(400, "Bad Request", "invalid_argument",
+                     "current_password and new_password are required");
+    }
+    const Status status = options_.store->change_password(who, current, next);
+    if (!status) {
+      if (status.code() == ErrorCode::kUnauthenticated) {
+        return problem(401, "Unauthorized", "unauthenticated", status.message());
+      }
+      return problem(status.code() == ErrorCode::kInvalidArgument ? 400 : 500,
+                     status.code() == ErrorCode::kInvalidArgument ? "Bad Request"
+                                                                  : "Internal Server Error",
+                     status.code() == ErrorCode::kInvalidArgument ? "invalid_argument"
+                                                                  : "internal",
+                     status.message());
+    }
+    return json(204, "");
   }
 
   if (resource == "devices") {

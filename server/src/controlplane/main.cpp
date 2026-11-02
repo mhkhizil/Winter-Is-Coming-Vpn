@@ -265,6 +265,14 @@ int main(int argc, char** argv) {
   vpn::api::RouterOptions router_options;
   router_options.store = store->get();
   router_options.token_ttl_seconds = 3600;
+  // The renewal-reminder endpoint needs the SMTP relay settings; empty host means
+  // "not configured", which the endpoint reports as 503 rather than pretending.
+  router_options.smtp_host = cfg.smtp.host;
+  router_options.smtp_port = cfg.smtp.port;
+  router_options.smtp_from = cfg.smtp.from;
+  router_options.smtp_username = cfg.smtp.username;
+  router_options.smtp_password = cfg.smtp.password;
+  router_options.smtp_dry_run = cfg.smtp.dry_run;
   vpn::api::Router router{router_options};
   server->set_router([&router](const vpn::controlplane::HttpRequest& request) {
     return router.handle(request);

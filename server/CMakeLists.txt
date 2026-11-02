@@ -22,6 +22,7 @@ add_library(vpn_core STATIC
   src/wire/noise.cpp
   src/wire/replay_window.cpp
   src/config/config.cpp
+  src/notify/smtp.cpp
   src/obs/metrics.cpp
 )
 

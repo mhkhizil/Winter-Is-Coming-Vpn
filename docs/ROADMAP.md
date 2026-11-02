@@ -18,7 +18,8 @@ tunnel). The one unproven link is interop with the *official* WireGuard client: 
 | TLS termination | **done (proxy contract)** | `tls.terminated_by_proxy` + `require_https` + HSTS + trusted-proxy CIDRs; nginx/Caddy configs; ADR-0009 |
 | `vpnctl` | **done** | `server/cli/main.cpp` |
 | Access control (admin-granted, manual payment) | **done** | ADR-0010; `vpnctl admin …`; enforced in CP and DP |
-| PostgreSQL adapter, gRPC CP->DP | not implemented | next increments |
+| Renewal reminders (SMTP) + CP->DP peer pull | **done** | ADR-0011; `vpnctl admin remind`, `vpn-dp --config-url` |
+| PostgreSQL adapter | not implemented | next increment |
 
 ## Original milestone plan
 

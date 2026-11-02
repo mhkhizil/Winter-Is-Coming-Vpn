@@ -6,7 +6,7 @@ executed (run `scripts/interop-test.sh`).**
 `vpn-dp` is a runnable tunnel server (Noise_IK handshake, per-peer keys, TUN on
 Linux, SIGHUP reload); `vpnd` serves the REST control plane (`/api/v1`) backed by a
 file store, so no database is required. TLS is terminated by an edge proxy with
-vpn-side enforcement ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md)) and `vpnctl` drives the API. Not implemented: PostgreSQL adapter, gRPC CP->DP. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+vpn-side enforcement ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md)) and `vpnctl` drives the API. Peers reach a node with `vpn-dp --config-url` and renewal reminders go out with `vpnctl admin remind`. Not implemented: PostgreSQL adapter. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/INTEROP.md`](docs/INTEROP.md).
 
 The intended product is a multi-tenant VPN backend in modern C++: a userspace
@@ -29,7 +29,9 @@ and telemetry.
 | TLS termination | — | **implemented as the edge-proxy contract**: `tls.terminated_by_proxy` + `tls.require_https` (403 for plaintext, fails closed), HSTS, trusted-proxy CIDRs, nginx/Caddy configs ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md)) |
 | `vpnctl` | — | **implemented and verified end-to-end** (`login -> nodes add -> devices -> set-key -> peers -> config -> delete`) |
 | Access/billing | — | **implemented as admin-granted access** (`vpnctl admin users add --months 6`), enforced in the control plane **and** the data plane; payment is manual ([ADR-0010](docs/DECISIONS/ADR-0010-admin-granted-access.md)) |
-| PostgreSQL adapter, gRPC CP→DP | — | not implemented (next increments) |
+| Renewal reminders | — | **implemented**: `vpnctl admin remind` (idempotent, cron-able) over plain SMTP to a local relay; `scripts/verify-reminders.ps1` ([ADR-0011](docs/DECISIONS/ADR-0011-reminders-and-peer-pull.md)) |
+| CP→DP config channel | — | **implemented**: `vpn-dp --config-url` pulls its peer table over HTTP in the TOML it already parses; verified with a real handshake ([ADR-0011](docs/DECISIONS/ADR-0011-reminders-and-peer-pull.md)) |
+| PostgreSQL adapter | — | not implemented (next increment) |
 | Android client | Kotlin | Folder placeholder only (`android/`) |
 | iOS client | Swift | Folder placeholder only (`ios/`) |
 
@@ -57,7 +59,7 @@ Reproduce with `pwsh -File scripts/build-local.ps1 -Jobs 1`.
   self-consistency cannot prove (`docs/INTEROP.md`).
 * No TLS stack in the binary by design: terminate TLS at nginx/caddy/LB and set `tls.terminated_by_proxy`/`tls.require_https` ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md), `deploy/nginx/vpn.conf`).
 * TUN forwarding is Linux-only; other platforms run handshake-only.
-* No PostgreSQL adapter and no gRPC CP->DP channel yet (access control is administrator-granted, ADR-0010).
+* No PostgreSQL adapter yet. Access is administrator-granted (ADR-0010), peers reach a node over HTTP (ADR-0011).
 
 ### Now implemented (previously listed as missing)
 

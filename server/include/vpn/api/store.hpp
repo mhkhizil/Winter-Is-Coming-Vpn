@@ -129,6 +129,37 @@ class Store {
   // re-enable later). Deletes nothing.
   [[nodiscard]] Status revoke_access(const Principal& actor, std::string_view user_id);
 
+  // --- credentials ----------------------------------------------------------
+  // The initial password is issued by an administrator, so a way to change it is
+  // not optional: otherwise every customer keeps the password that travelled
+  // through a chat message.
+  [[nodiscard]] Status change_password(const Principal& actor, std::string_view current,
+                                       std::string_view next);
+  // Administrator reset for a customer who forgot theirs. Does not require the
+  // old password; it is the "phone the operator" path.
+  [[nodiscard]] Status reset_password(const Principal& actor, std::string_view user_id,
+                                      std::string_view next);
+
+  // --- renewal reminders ----------------------------------------------------
+  // Accounts whose access ends within `within_days` and which have not already
+  // been reminded for `bucket` (e.g. "7d", "1d"). Idempotent: a daily cron may
+  // call this as often as it likes.
+  struct ExpiringAccount {
+    UserRecord user{};
+    std::string email{};
+  };
+  [[nodiscard]] Result<std::vector<ExpiringAccount>> accounts_expiring_within(
+      const Principal& actor, std::int64_t within_days, std::string_view bucket) const;
+  // Records that the reminder for (user, bucket) was sent, so it is not repeated.
+  [[nodiscard]] Status mark_reminder_sent(const Principal& actor, std::string_view user_id,
+                                          std::string_view bucket);
+
+  // --- data plane -----------------------------------------------------------
+  // The whole peer table rendered as the TOML subset vpn-dp already parses, so a
+  // node can be bootstrapped with `vpn-dp --config-url ...` instead of an operator
+  // hand-copying keys. Includes each peer's access expiry (ADR-0010).
+  [[nodiscard]] Result<std::string> render_dp_config(const Principal& actor, std::string_view node_id) const;
+
   // "Can this account create peers / fetch configurations right now?"
   // A missing grant means a legacy or staff account and is treated as active.
   [[nodiscard]] bool access_active(std::string_view user_id) const;
@@ -164,6 +195,7 @@ class Store {
  private:
   [[nodiscard]] bool access_active_locked(const std::string& user_id) const;
   [[nodiscard]] AccessGrant access_grant_locked(const std::string& user_id) const;
+  [[nodiscard]] Status reset_password_locked(const std::string& user_id, std::string_view next);
   [[nodiscard]] Status append_line(const std::string& line);
   void replay(const std::string& content);
   [[nodiscard]] bool ip_taken(std::string_view ipv4) const;
@@ -183,6 +215,8 @@ class Store {
   std::unordered_map<std::string, Peer> peers_;
   std::vector<NodeInfo> nodes_;
   std::unordered_map<std::string, AccessGrant> access_;
+  // "<user-id>|<bucket>" -> unix time the reminder was sent (idempotency).
+  std::unordered_map<std::string, std::int64_t> reminders_;
 };
 
 }  // namespace vpn::api

@@ -23,6 +23,14 @@ struct RouterOptions {
   std::uint32_t token_ttl_seconds{3600};
   std::uint32_t rate_limit_per_second{20};
   std::uint32_t rate_limit_burst{40};
+  // Renewal reminders (ADR-0011). Empty host means the endpoint reports that
+  // email is not configured instead of pretending to send.
+  std::string smtp_host{};
+  std::uint16_t smtp_port{25};
+  std::string smtp_from{};
+  std::string smtp_username{};
+  std::string smtp_password{};
+  bool smtp_dry_run{false};
 };
 
 class Router {

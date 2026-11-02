@@ -158,3 +158,40 @@ vpnctl me                               # plan, status, days left (as the custom
 3. `vpnctl admin users` weekly: anyone with a small `days_left` gets a reminder.
 4. Non-payment: `vpnctl admin revoke <user-id>` — the tunnel drops immediately.
 
+
+
+## Credentials and renewal reminders (implemented, ADR-0011)
+
+| Method | Path | Body | Notes |
+|---|---|---|---|
+| POST | `/api/v1/me/password` | `{"current_password","new_password"}` | `204`. The initial password is issued by an administrator, so users must be able to change it. Wrong current password → `401`. |
+| POST | `/api/v1/admin/users/{id}/password` | `{"password"}` | `204`. Administrator reset for a customer who forgot theirs. |
+| POST | `/api/v1/admin/reminders/run` | query: `days=7,1`, `dry_run=1` | One mail per account per bucket. `{"sent":n,"failed":n,"dry_run":bool}`; `502` if any send failed (those stay unmarked and are retried). Idempotent: a daily cron cannot double-mail. `503` when SMTP is unconfigured. |
+| GET | `/api/v1/dp/config` | query: `node=<id>` | The peer table as the TOML subset `vpn-dp` parses, for `vpn-dp --config-url`. Administrator only. |
+
+```bash
+vpnctl passwd --current <old> --new <new>
+vpnctl admin set-password <user-id> --password <new>
+vpnctl admin remind --days 7,1          # cron: 0 9 * * * vpnctl admin remind
+vpnctl admin dp-config                 # what a node would pull
+```
+
+### Node bootstrap with no hand-copied keys
+
+```toml
+# /etc/vpn/datad.toml - interface only; peers arrive over HTTP
+[interface]
+private_key = "<from: vpn-dp --genkey>"
+listen = "0.0.0.0:51820"
+tun = "wg0"
+```
+
+```bash
+vpn-dp --config /etc/vpn/datad.toml \
+       --config-url http://127.0.0.1:8080/api/v1/dp/config \
+       --token "$VPN_DP_TOKEN" --refresh 60
+```
+
+`http://` only: terminate TLS in a local relay (stunnel) or reach the control plane
+over a private network (ADR-0009/ADR-0011). A failed pull logs a warning and keeps
+the last good table, so a control-plane outage never drops live tunnels.

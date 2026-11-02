@@ -33,6 +33,7 @@
 #else
 #include <arpa/inet.h>
 #include <cstdlib>
+#include <netdb.h>      // addrinfo / getaddrinfo for `--config-url`
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -429,8 +430,167 @@ int generate_key() {
 
 }  // namespace
 
+// --- control-plane pull (ADR-0011) ------------------------------------------
+//
+// The control plane renders the peer table in the *same* TOML subset this file
+// already parses, so `--config-url` needs no second format and no JSON parser.
+// Only the [[peer]] blocks come from the control plane: the [interface] block
+// (private key, listen, tun) stays local, because a node's private key must never
+// travel.
+//
+// Only http:// is accepted. TLS is terminated by a local relay (stunnel on
+// 127.0.0.1) or the control plane is reached over a private network, exactly as in
+// ADR-0009: this binary has no TLS stack, and it will not grow one.
+constexpr Socket kNoMediaSocket = static_cast<Socket>(-1);
+
+void close_media_socket(Socket fd) noexcept {
+#if defined(_WIN32)
+  ::closesocket(fd);
+#else
+  ::close(fd);
+#endif
+}
+
+std::string g_effective_config;
+
+bool http_get(const std::string& url, const std::string& token, std::string& body,
+              std::string& error) {
+  const std::string scheme = "http://";
+  if (url.rfind(scheme, 0) != 0) {
+    error = "only http:// URLs are supported (terminate TLS in a local relay)";
+    return false;
+  }
+  const std::string rest = url.substr(scheme.size());
+  const std::size_t slash = rest.find('/');
+  const std::string authority = slash == std::string::npos ? rest : rest.substr(0, slash);
+  const std::string path = slash == std::string::npos ? "/" : rest.substr(slash);
+  std::string host = authority;
+  std::string port = "80";
+  const std::size_t colon = authority.rfind(':');
+  if (colon != std::string::npos) {
+    host = authority.substr(0, colon);
+    port = authority.substr(colon + 1);
+  }
+  if (host.empty()) {
+    error = "bad URL: no host";
+    return false;
+  }
+
+  addrinfo hints{};
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+#if defined(_WIN32)
+  // The first pull can happen before main() reaches WSAStartup.
+  static bool wsa_ready = false;
+  if (!wsa_ready) {
+    WSADATA data{};
+    if (::WSAStartup(MAKEWORD(2, 2), &data) != 0) {
+      error = "WSAStartup failed";
+      return false;
+    }
+    wsa_ready = true;
+  }
+#endif
+  addrinfo* addresses = nullptr;
+  if (::getaddrinfo(host.c_str(), port.c_str(), &hints, &addresses) != 0) {
+    error = "cannot resolve " + host;
+    return false;
+  }
+  Socket fd = kNoMediaSocket;
+  for (addrinfo* it = addresses; it != nullptr; it = it->ai_next) {
+    fd = static_cast<Socket>(::socket(it->ai_family, it->ai_socktype, it->ai_protocol));
+    if (fd == kNoMediaSocket) continue;
+#if defined(_WIN32)
+    const int addr_len = static_cast<int>(it->ai_addrlen);
+#else
+    const socklen_t addr_len = static_cast<socklen_t>(it->ai_addrlen);
+#endif
+    if (::connect(fd, it->ai_addr, addr_len) == 0) break;
+    close_media_socket(fd);
+    fd = kNoMediaSocket;
+  }
+  ::freeaddrinfo(addresses);
+  if (fd == kNoMediaSocket) {
+    error = "cannot connect to " + host + ":" + port;
+    return false;
+  }
+
+  std::string request = "GET " + path + " HTTP/1.0\r\nHost: " + host + "\r\n";
+  if (!token.empty()) request += "Authorization: Bearer " + token + "\r\n";
+  request += "Connection: close\r\n\r\n";
+  if (::send(fd, request.data(), static_cast<SendSize>(request.size()), 0) <= 0) {
+    error = "send failed";
+    close_media_socket(fd);
+    return false;
+  }
+  std::string raw;
+  char chunk[4096];
+  for (;;) {
+    const auto n = ::recv(fd, chunk, static_cast<SendSize>(sizeof(chunk)), 0);
+    if (n <= 0) break;
+    raw.append(chunk, static_cast<std::size_t>(n));
+    if (raw.size() > (4U << 20U)) break;
+  }
+  close_media_socket(fd);
+
+  const std::size_t header_end = raw.find("\r\n\r\n");
+  if (header_end == std::string::npos) {
+    error = "malformed response";
+    return false;
+  }
+  const std::string head = raw.substr(0, header_end);
+  const std::size_t space = head.find(' ');
+  const int status = space == std::string::npos ? 0 : std::atoi(head.c_str() + space + 1);
+  if (status != 200) {
+    error = "control plane returned HTTP " + std::to_string(status);
+    return false;
+  }
+  body = raw.substr(header_end + 4);
+  return true;
+}
+
+// Writes the local [interface] block followed by the peers from the control plane
+// to `<config>.remote`, and points the reload path at that file.
+bool pull_peers(const std::string& url, const std::string& token, const std::string& local_path,
+                std::string& error) {
+  std::string fetched;
+  if (!http_get(url, token, fetched, error)) return false;
+
+  std::string merged;
+  std::FILE* local = std::fopen(local_path.c_str(), "rb");
+  if (local == nullptr) {
+    error = "cannot read " + local_path;
+    return false;
+  }
+  char buffer[4096];
+  std::size_t read = 0;
+  while ((read = std::fread(buffer, 1, sizeof(buffer), local)) > 0) merged.append(buffer, read);
+  std::fclose(local);
+
+  // Everything from the first peer block onwards is replaced by the remote table.
+  const std::size_t first_peer = merged.find("[[peer]]");
+  if (first_peer != std::string::npos) merged.resize(first_peer);
+
+  merged += "# --- peers pulled from the control plane ---\n";
+  merged += fetched;
+  if (merged.empty() || merged.back() != '\n') merged += "\n";
+
+  g_effective_config = local_path + ".remote";
+  std::FILE* out = std::fopen(g_effective_config.c_str(), "wb");
+  if (out == nullptr) {
+    error = "cannot write " + g_effective_config;
+    return false;
+  }
+  std::fwrite(merged.data(), 1, merged.size(), out);
+  std::fclose(out);
+  return true;
+}
+
 int main(int argc, char** argv) {
   std::string config_path;
+  std::string config_url;
+  std::string control_plane_token;
+  int refresh_secs = 60;
   for (int i = 1; i < argc; ++i) {
     const std::string arg = argv[i];
     if (arg == "--help" || arg == "-h") {
@@ -446,6 +606,19 @@ int main(int argc, char** argv) {
       config_path = argv[++i];
       continue;
     }
+    if (arg == "--config-url" && i + 1 < argc) {
+      config_url = argv[++i];
+      continue;
+    }
+    if (arg == "--token" && i + 1 < argc) {
+      control_plane_token = argv[++i];
+      continue;
+    }
+    if (arg == "--refresh" && i + 1 < argc) {
+      refresh_secs = std::atoi(argv[++i]);
+      if (refresh_secs < 0) refresh_secs = 0;
+      continue;
+    }
     std::fprintf(stderr, "error: unknown argument '%s'\n", arg.c_str());
     return 2;
   }
@@ -454,7 +627,24 @@ int main(int argc, char** argv) {
     return 2;
   }
 
-  auto loaded = load_config(config_path);
+  const char* token_from_env = std::getenv("VPN_DP_TOKEN");
+  if (control_plane_token.empty() && token_from_env != nullptr) {
+    control_plane_token = token_from_env;
+  }
+
+  g_effective_config = config_path;
+  if (!config_url.empty()) {
+    std::string pull_error;
+    if (!pull_peers(config_url, control_plane_token, config_path, pull_error)) {
+      std::fprintf(stderr, "error: cannot pull peers from %s: %s\n", config_url.c_str(),
+                   pull_error.c_str());
+      return 2;
+    }
+    std::printf("peers pulled from %s\n", config_url.c_str());
+    std::fflush(stdout);
+  }
+
+  auto loaded = load_config(g_effective_config);
   if (!loaded) {
     std::fprintf(stderr, "error: %s\n", loaded.error().to_string().c_str());
     return 2;
@@ -510,8 +700,26 @@ int main(int argc, char** argv) {
   Statistics stats{};
   Byte datagram[65536];
   Byte inner[65536];
+  auto next_refresh =
+      std::chrono::steady_clock::now() + std::chrono::seconds(refresh_secs > 0 ? refresh_secs : 3600);
 
   while (!g_stop.load()) {
+    // Periodic pull from the control plane (ADR-0011): new and expired peers are
+    // picked up without anyone touching this node. A failed pull keeps the last
+    // known good table: losing the control plane must never drop live tunnels.
+    if (refresh_secs > 0 && !config_url.empty()) {
+      const auto now = std::chrono::steady_clock::now();
+      if (now >= next_refresh) {
+        next_refresh = now + std::chrono::seconds(refresh_secs);
+        std::string pull_error;
+        if (pull_peers(config_url, control_plane_token, config_path, pull_error)) {
+          g_reload.store(true);
+        } else {
+          std::fprintf(stderr, "warning: peer pull failed (keeping the current table): %s\n",
+                       pull_error.c_str());
+        }
+      }
+    }
     fd_set read_set;
     FD_ZERO(&read_set);
     FD_SET(socket.fd, &read_set);
@@ -528,7 +736,7 @@ int main(int argc, char** argv) {
     if (ready <= 0) continue;
 
     if (g_reload.exchange(false)) {
-      auto reloaded = load_config(config_path);
+      auto reloaded = load_config(g_effective_config);
       if (!reloaded) {
         std::fprintf(stderr, "warning: config reload failed: %s\n",
                      reloaded.error().to_string().c_str());

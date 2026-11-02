@@ -483,6 +483,21 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape)
     return 0;
   }
 
+  if (command == "passwd") {
+    const std::string current = arg_value(argc, argv, "--current");
+    const std::string next = arg_value(argc, argv, "--new");
+    if (current.empty() || next.empty()) {
+      std::fprintf(stderr, "error: usage: vpnctl passwd --current <old> --new <new>\n");
+      return 2;
+    }
+    const Reply reply = http_request(url, "POST", "/api/v1/me/password", token,
+                                     R"({"current_password":")" + current + R"(","new_password":")" +
+                                         next + R"("})");
+    if (reply.status != 204 && reply.status != 200) return fail(reply);
+    std::printf("password changed\n");
+    return 0;
+  }
+
   if (command == "admin") {
     const std::string action = positional(argc, argv, 1);
     const std::string sub = positional(argc, argv, 2);
@@ -571,6 +586,43 @@ int main(int argc, char** argv) {  // NOLINT(bugprone-exception-escape)
                                       "{}");
       if (reply.status != 204 && reply.status != 200) return fail(reply);
       std::printf("access revoked for %s\n", sub.c_str());
+      return 0;
+    }
+
+    // Password reset for a customer who forgot theirs.
+    if (action == "set-password" && !sub.empty()) {
+      const std::string password = arg_value(argc, argv, "--password");
+      if (password.empty()) {
+        std::fprintf(stderr, "error: usage: vpnctl admin set-password <user-id> --password <pw>\n");
+        return 2;
+      }
+      const Reply reply = http_request(url, "POST", "/api/v1/admin/users/" + sub + "/password",
+                                       token, R"({"password":")" + password + R"("})");
+      if (reply.status != 204 && reply.status != 200) return fail(reply);
+      std::printf("password reset for %s\n", sub.c_str());
+      return 0;
+    }
+
+    // Renewal reminders: cron-able and idempotent (one mail per account per bucket).
+    if (action == "remind") {
+      std::string query = "/api/v1/admin/reminders/run";
+      const std::string days = arg_value(argc, argv, "--days");
+      query += "?days=" + (days.empty() ? std::string{"7,1"} : days);
+      if (argc > 2 && std::strcmp(argv[argc - 1], "--dry-run") == 0) query += "&dry_run=1";
+      const Reply reply = http_request(url, "POST", query, token, {});
+      if (reply.status != 200 && reply.status != 502) return fail(reply);
+      std::printf("%s\n", reply.body.c_str());
+      return reply.status == 200 ? 0 : 1;
+    }
+
+    // The peer table a node should run, in the TOML subset vpn-dp reads.
+    if (action == "dp-config") {
+      std::string path = "/api/v1/dp/config";
+      const std::string node = arg_value(argc, argv, "--node");
+      if (!node.empty()) path += "?node=" + node;
+      const Reply reply = get(path);
+      if (reply.status != 200) return fail(reply);
+      std::printf("%s", reply.body.c_str());
       return 0;
     }
 

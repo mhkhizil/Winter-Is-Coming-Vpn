@@ -60,6 +60,21 @@ struct LogConfig {
   std::string format{"json"};  // json | text
 };
 
+// Renewal reminders (ADR-0011). Empty host disables them; see
+// vpn/include/vpn/notify/smtp.hpp for why this speaks plain SMTP to a local relay
+// rather than doing TLS itself.
+struct SmtpConfig {
+  std::string host{};
+  std::uint16_t port{25};
+  std::string from{};
+  std::string username{};
+  std::string password{};
+  bool dry_run{false};
+  // Days before expiry at which a reminder is sent. One run per bucket, then the
+  // account is marked so a daily job never repeats itself.
+  std::vector<std::uint32_t> reminder_days{7, 1};
+};
+
 struct HttpConfig {
   Endpoint bind{"127.0.0.1", 8080};
   std::uint32_t request_timeout_secs{10};
@@ -74,6 +89,7 @@ struct ServerConfig {
   HttpConfig http{};
   Endpoint metrics_bind{"127.0.0.1", 9100};
   TlsConfig tls{};
+  SmtpConfig smtp{};
   RateLimitConfig rate_limit{};
   std::string admin_token{};
 };

@@ -42,6 +42,10 @@ std::string pepper() {
 }
 
 // Passwords are never stored: only HMAC-BLAKE2s-256(pepper, password), hex.
+// Hex of a 32-byte HMAC is always 64 characters; used for the constant-time
+// comparison of password hashes.
+constexpr std::size_t kPasswordHashLength = 64;
+
 std::string hash_password(std::string_view password) {
   const std::string key = pepper();
   Bytes<32> mac = crypto::hmac_blake2s_256(
@@ -147,6 +151,9 @@ void Store::replay(const std::string& content) {
       grant.plan = f[3];
       grant.status = f[4];
       access_[f[1]] = grant;
+    } else if (kind == "R" && f.size() >= 4) {
+      // Reminder already sent for (user, bucket); keeps the daily job idempotent.
+      reminders_[f[1] + "|" + f[2]] = std::atoll(f[3].c_str());
     } else if (kind == "T" && f.size() >= 4) {
       token_to_user_[f[1]] = f[2];
       token_expiry_[f[1]] = std::atoll(f[3].c_str());
@@ -236,6 +243,13 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
     (void)store->append_line("E\t" + entry.first + "\t" +
                              std::to_string(entry.second.expires_at) + "\t" + entry.second.plan +
                              "\t" + entry.second.status);
+  }
+  for (const auto& entry : store->reminders_) {
+    const std::size_t bar = entry.first.find('|');
+    if (bar == std::string::npos) continue;
+    (void)store->append_line("R\t" + entry.first.substr(0, bar) + "\t" +
+                             entry.first.substr(bar + 1) + "\t" +
+                             std::to_string(entry.second));
   }
   for (const auto& entry : store->token_to_user_) {
     const std::int64_t expiry = store->token_expiry_[entry.first];
@@ -798,6 +812,128 @@ Status Store::revoke_access(const Principal& actor, std::string_view user_id) {
   if (!appended) return appended;
   access_[it->first] = grant;
   return Status{};
+}
+
+Status Store::change_password(const Principal& actor, std::string_view current,
+                             std::string_view next) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = users_.find(actor.user_id);
+  if (it == users_.end()) return Status{ErrorCode::kNotFound, "no such user"};
+  if (next.size() < 8) {
+    return Status{ErrorCode::kInvalidArgument, "the new password must be at least 8 characters"};
+  }
+  if (!ct::equal(ByteSpan{reinterpret_cast<const Byte*>(hash_password(current).data()),
+                          kPasswordHashLength},
+                 ByteSpan{reinterpret_cast<const Byte*>(password_hashes_[it->first].data()),
+                          kPasswordHashLength})) {
+    // Same message either way: never reveal whether the old password was close.
+    return Status{ErrorCode::kUnauthenticated, "current password is incorrect"};
+  }
+  return reset_password_locked(it->first, next);
+}
+
+Status Store::reset_password(const Principal& actor, std::string_view user_id,
+                             std::string_view next) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) return Status{ErrorCode::kPermissionDenied, "administrator role required"};
+  if (users_.find(std::string{user_id}) == users_.end()) {
+    return Status{ErrorCode::kNotFound, "no such user"};
+  }
+  if (next.size() < 8) {
+    return Status{ErrorCode::kInvalidArgument,
+                  "the new password must be at least 8 characters"};
+  }
+  return reset_password_locked(std::string{user_id}, next);
+}
+
+Status Store::reset_password_locked(const std::string& user_id, std::string_view next) {
+  std::string email;
+  for (const auto& entry : user_email_to_id_) {
+    if (entry.second == user_id) {
+      email = entry.first;
+      break;
+    }
+  }
+  if (email.empty()) return Status{ErrorCode::kInternal, "user has no email"};
+  const std::string hash = hash_password(next);
+  // A `U` line is upserted by user id on replay, so this replaces the old hash.
+  const Status appended = append_line("U\t" + user_id + "\t" + users_[user_id].tenant_id + "\t" +
+                                      email + "\t" + hash + "\t" + users_[user_id].role);
+  if (!appended) return appended;
+  password_hashes_[user_id] = hash;
+  return Status{};
+}
+
+Result<std::vector<Store::ExpiringAccount>> Store::accounts_expiring_within(
+    const Principal& actor, std::int64_t within_days, std::string_view bucket) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  const std::int64_t now = now_unix();
+  const std::int64_t horizon = now + within_days * 86400;
+  std::vector<ExpiringAccount> out;
+  for (const auto& entry : users_) {
+    const AccessGrant grant = access_grant_locked(entry.first);
+    if (grant.status != "active" || grant.expires_at == 0) continue;
+    if (grant.expires_at <= now || grant.expires_at > horizon) continue;
+    if (reminders_.count(entry.first + "|" + std::string{bucket}) != 0) continue;
+    ExpiringAccount account;
+    account.user = to_record(entry.first, entry.second, email_of(user_email_to_id_, entry.first),
+                             grant);
+    account.email = account.user.email;
+    out.push_back(account);
+  }
+  return out;
+}
+
+Status Store::mark_reminder_sent(const Principal& actor, std::string_view user_id,
+                                 std::string_view bucket) {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) return Status{ErrorCode::kPermissionDenied, "administrator role required"};
+  const std::string key = std::string{user_id} + "|" + std::string{bucket};
+  const std::int64_t now = now_unix();
+  const Status appended =
+      append_line("R\t" + std::string{user_id} + "\t" + std::string{bucket} + "\t" +
+                  std::to_string(now));
+  if (!appended) return appended;
+  reminders_[key] = now;
+  return Status{};
+}
+
+Result<std::string> Store::render_dp_config(const Principal& actor,
+                                            std::string_view node_id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  if (!is_admin(actor)) {
+    return make_error(ErrorCode::kPermissionDenied, "administrator role required");
+  }
+  if (nodes_.empty()) {
+    return make_error(ErrorCode::kUnavailable, "no node registered: vpnctl nodes add ...");
+  }
+  std::string node = std::string{node_id};
+  if (node.empty()) node = nodes_.front().id;
+
+  std::string out = "# Generated by vpnd for node " + node + "\n";
+  out += "# The node's own private_key is deliberately absent: it never leaves the node.\n";
+  out += "# Revoked accounts are omitted; expired ones are listed so that extending\n";
+  out += "# access takes effect on the next refresh without touching the node.\n";
+  std::size_t peers = 0;
+  for (const auto& entry : peers_) {
+    const Peer& peer = entry.second;
+    if (peer.status != "active") continue;
+    const auto device = devices_.find(peer.device_id);
+    if (device == devices_.end()) continue;
+    const AccessGrant grant = access_grant_locked(device->second.user_id);
+    if (grant.status != "active") continue;  // revoked: drop from the node entirely
+    out += "\n[[peer]]\n";
+    out += "name = \"" + peer.id + "\"\n";
+    out += "public_key = \"" + peer.public_key_hex + "\"\n";
+    out += "allowed_ips = [\"" + peer.ipv4 + "/32\"]\n";
+    out += "expires_at = " + std::to_string(grant.expires_at) + "\n";
+    ++peers;
+  }
+  if (peers == 0) out += "\n# no active peers yet\n";
+  return out;
 }
 
 }  // namespace vpn::api
