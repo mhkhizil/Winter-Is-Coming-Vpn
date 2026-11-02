@@ -310,7 +310,11 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       }
       return json(204, "");
     }
-    return problem(404, "Not Found", "not_found");
+    // `rotate` needs the caller's identity, so it is handled after authentication
+    // below rather than being 404'd here.
+    if (action != "rotate") {
+      return problem(404, "Not Found", "not_found");
+    }
   }
 
   auto principal = authenticate(request);
@@ -327,6 +331,26 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
                          "\",\"access\":" + user_json(UserRecord{who.user_id, who.tenant_id, "",
                                                                  who.role, grant}, now) +
                          "}");
+  }
+
+  // POST /api/v1/auth/rotate -> a fresh token, and the presented one dies.
+  //
+  // Containment for a leaked token: the client keeps its identity and its access
+  // window, and the old value stops working immediately. Rotation is not a refresh
+  // flow (no request body, no long-lived refresh secret); it is deliberately the
+  // simplest thing that removes a token from circulation without a logout.
+  if (resource == "auth" && parts.size() >= 4 && parts[3] == "rotate" &&
+      request.method == "POST") {
+    std::string presented;
+    const std::string& header = request.authorization;
+    const std::size_t space = header.find(' ');
+    if (space != std::string::npos) presented = header.substr(space + 1);
+    const auto issued = options_.store->issue_token(who, options_.token_ttl_seconds);
+    if (!issued) return problem(500, "Internal Server Error", "internal");
+    if (!presented.empty()) (void)options_.store->revoke_token(presented);
+    return json(200, "{\"access_token\":\"" + *issued +
+                         "\",\"token_type\":\"Bearer\",\"expires_in\":" +
+                         std::to_string(options_.token_ttl_seconds) + "}");
   }
 
   // --- administration: accounts and paid access (ADR-0010) -------------------
@@ -521,6 +545,33 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       if (!detail.empty()) body += ",\"errors\":\"" + escape(detail) + "\"";
       body += "}";
       return json(failed == 0 ? 200 : 502, body);
+    }
+
+    // GET /api/v1/admin/audit?limit=N -> recent administrator actions.
+    //
+    // The records were already being written (user.create/grant/revoke, password
+    // resets); this is the read side, so "who gave this person access, and when"
+    // is answerable without opening the store file on the host.
+    if (parts.size() >= 4 && parts[3] == "audit" && request.method == "GET") {
+      std::size_t limit = 100;
+      const std::size_t at = request.query.find("limit=");
+      if (at != std::string::npos) {
+        const long parsed = std::strtol(request.query.c_str() + at + 6, nullptr, 10);
+        if (parsed > 0) limit = static_cast<std::size_t>(parsed);
+      }
+      const auto entries = options_.store->list_audit(who, limit);
+      if (!entries) return fail(status_for(entries.error().code()), entries.error().message());
+      std::string body = "{\"data\":[";
+      bool first = true;
+      for (const Store::AuditEntry& entry : *entries) {
+        if (!first) body += ',';
+        first = false;
+        body += "{\"actor\":\"" + escape(entry.actor) + "\",\"action\":\"" + escape(entry.action) +
+                "\",\"target\":\"" + escape(entry.target) + "\",\"at\":" +
+                std::to_string(entry.at) + "}";
+      }
+      body += "]}";
+      return json(200, body);
     }
 
     return problem(404, "Not Found", "not_found");

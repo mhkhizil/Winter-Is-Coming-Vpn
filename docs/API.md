@@ -164,6 +164,8 @@ vpnctl me                               # plan, status, days left (as the custom
 
 | Method | Path | Body | Notes |
 |---|---|---|---|
+| POST | `/api/v1/auth/rotate` | — | `200`. Returns a **new** `access_token` and immediately revokes the one presented in the `Authorization` header. Containment for a leaked token: same identity, same access window, old value dead. Not a refresh flow — there is no long-lived refresh secret. |
+| POST | `/api/v1/admin/audit`→`GET` | query: `limit=N` (default 100) | `{"data":[{"actor","action","target","at"}]}` of recent administrator actions (`user.create`, `user.grant`, `user.revoke`), newest last. Administrator only. |
 | POST | `/api/v1/me/password` | `{"current_password","new_password"}` | `204`. The initial password is issued by an administrator, so users must be able to change it. Wrong current password → `401`. |
 | POST | `/api/v1/admin/users/{id}/password` | `{"password"}` | `204`. Administrator reset for a customer who forgot theirs. |
 | POST | `/api/v1/admin/reminders/run` | query: `days=7,1`, `dry_run=1` | One mail per account per bucket. `{"sent":n,"failed":n,"dry_run":bool}`; `502` if any send failed (those stay unmarked and are retried). Idempotent: a daily cron cannot double-mail. `503` when SMTP is unconfigured. |
