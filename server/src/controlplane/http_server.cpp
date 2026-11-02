@@ -243,10 +243,17 @@ constexpr std::size_t kMaxDrainedBody = 1U << 20U;
 [[nodiscard]] const char* reason_phrase(int status) noexcept {
   switch (status) {
     case 200: return "OK";
+    case 201: return "Created";
+    case 204: return "No Content";
     case 400: return "Bad Request";
+    case 401: return "Unauthorized";
+    case 403: return "Forbidden";
     case 404: return "Not Found";
     case 405: return "Method Not Allowed";
     case 408: return "Request Timeout";
+    case 409: return "Conflict";
+    case 422: return "Unprocessable Entity";
+    case 429: return "Too Many Requests";
     case 431: return "Request Header Fields Too Large";
     case 500: return "Internal Server Error";
     case 503: return "Service Unavailable";
@@ -256,11 +263,13 @@ constexpr std::size_t kMaxDrainedBody = 1U << 20U;
 
 // Serialises a response. HEAD gets identical headers and no body, which is what
 // RFC 9110 9.3.2 requires (Content-Length describes the would-be body).
+// `extra_headers` must carry its own leading CRLF for each header.
 [[nodiscard]] std::string build_response(int status, std::string_view content_type,
-                                         std::string_view body, bool is_head) {
+                                         std::string_view body, bool is_head,
+                                         std::string_view extra_headers = {}) {
   const std::string length = std::to_string(body.size());
   std::string out;
-  out.reserve(body.size() + length.size() + 256);
+  out.reserve(body.size() + length.size() + 256 + extra_headers.size());
   out += "HTTP/1.1 " + std::to_string(status) + ' ';
   out += reason_phrase(status);
   out += "\r\nServer: vpnd/" VPN_VERSION;
@@ -270,6 +279,7 @@ constexpr std::size_t kMaxDrainedBody = 1U << 20U;
   out += length;
   out += "\r\nCache-Control: no-store\r\nX-Content-Type-Options: nosniff";
   if (status == 405) out += "\r\nAllow: GET, HEAD";
+  out += extra_headers;
   out += "\r\nConnection: close\r\n\r\n";
   if (!is_head) out += body;
   return out;
@@ -285,6 +295,107 @@ constexpr std::size_t kMaxDrainedBody = 1U << 20U;
 void send_problem(SocketHandle fd, int status, std::string_view title) {
   const std::string body = problem_body(status, title);
   (void)send_all(fd, build_response(status, "application/problem+json", body, false));
+}
+
+// --- TLS-termination policy helpers (ADR-0009) ------------------------------
+//
+// vpnd does not terminate TLS itself: a reverse proxy does, and asserts the
+// original scheme in `X-Forwarded-Proto`. That header is only evidence when the
+// peer is one of our proxies, which is what these helpers decide. An attacker
+// connecting straight to the socket gets `trusted == false` and therefore cannot
+// claim https, so a misconfigured firewall fails closed (403) instead of silently
+// serving the API in cleartext.
+
+[[nodiscard]] bool parse_ipv4(std::string_view text, std::uint8_t out[4]) noexcept {
+  std::size_t octet = 0;
+  std::size_t i = 0;
+  while (i < text.size() && octet < 4) {
+    unsigned value = 0;
+    std::size_t digits = 0;
+    while (i < text.size() && text[i] >= '0' && text[i] <= '9' && digits < 3) {
+      value = value * 10 + static_cast<unsigned>(text[i] - '0');
+      ++i;
+      ++digits;
+    }
+    if (digits == 0 || value > 255U) return false;
+    out[octet++] = static_cast<std::uint8_t>(value);
+    if (i < text.size()) {
+      if (text[i] != '.') return false;
+      ++i;
+    }
+  }
+  return octet == 4 && i == text.size();
+}
+
+// Accepts "10.0.0.0/8", "10.1.2.3" and the "::ffff:127.0.0.1" form that a
+// dual-stack listener reports for IPv4 peers. Non-IPv4 peers match textually.
+[[nodiscard]] bool cidr_match(std::string_view ip, std::string_view spec) noexcept {
+  constexpr std::string_view kMapped = "::ffff:";
+  if (ip.rfind(kMapped, 0) == 0) ip.remove_prefix(kMapped.size());
+
+  std::uint8_t addr[4] = {};
+  std::uint8_t net[4] = {};
+  if (!parse_ipv4(ip, addr)) return ip == spec;
+
+  const std::size_t slash = spec.find('/');
+  const std::string_view host = slash == std::string_view::npos ? spec : spec.substr(0, slash);
+  if (!parse_ipv4(host, net)) return false;
+
+  unsigned bits = 32U;
+  if (slash != std::string_view::npos) {
+    bits = 0;
+    for (const char c : spec.substr(slash + 1)) {
+      if (c < '0' || c > '9') return false;
+      bits = bits * 10U + static_cast<unsigned>(c - '0');
+      if (bits > 32U) return false;
+    }
+  }
+  for (unsigned k = 0; k < 4; ++k) {
+    const unsigned shift = k * 8U;
+    if (bits <= shift) return true;
+    const unsigned mask = bits >= shift + 8U ? 0xFFU : (0xFFU << (shift + 8U - bits)) & 0xFFU;
+    if ((addr[k] & mask) != (net[k] & mask)) return false;
+  }
+  return true;
+}
+
+[[nodiscard]] bool is_trusted_proxy(std::string_view client_ip,
+                                   const std::vector<std::string>& proxies) noexcept {
+  for (const std::string& spec : proxies) {
+    if (!spec.empty() && cidr_match(client_ip, spec)) return true;
+  }
+  return false;
+}
+
+// Case-insensitive header lookup on an already-received header block. Returns the
+// trimmed value, or an empty string when the header is absent.
+[[nodiscard]] std::string header_value(std::string_view header_block, std::string_view name) {
+  std::string lower{header_block};
+  for (char& c : lower) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  const std::string needle = "\r\n" + std::string{name} + ":";
+  const std::size_t at = lower.find(needle);
+  if (at == std::string::npos) return {};
+  std::size_t start = at + needle.size();
+  while (start < header_block.size() &&
+         (header_block[start] == ' ' || header_block[start] == '\t')) {
+    ++start;
+  }
+  std::size_t end = header_block.find("\r\n", start);
+  if (end == std::string::npos) end = header_block.size();
+  std::string value{header_block.substr(start, end - start)};
+  for (char& c : value) {
+    if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+  }
+  return value;
+}
+
+// Liveness/readiness/metrics must stay reachable over plain HTTP: Kubernetes
+// probes and Prometheus scrapes hit the pod directly, and none of these leak data
+// that requires transport security.
+[[nodiscard]] bool tls_exempt_path(std::string_view path) noexcept {
+  return path == "/healthz" || path == "/readyz" || path == "/metrics";
 }
 
 // Bounded label vocabulary. Only routes this server actually has keep their own
@@ -706,8 +817,51 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
       request.authorization = header_block.substr(start, end - start);
     }
   }
+  // --- TLS policy (ADR-0009) ------------------------------------------------
+  // TLS is terminated in front of us. `X-Forwarded-Proto` is evidence only when
+  // the peer is a trusted proxy; a client that connects to this socket directly
+  // cannot claim https, so `require_https` fails closed.
+  bool over_tls = false;
+  if (!options_.tls.trusted_proxies.empty()) {
+    const std::string header_block = buffer.substr(0, header_end);
+    if (is_trusted_proxy(request.client_ip, options_.tls.trusted_proxies)) {
+      request.forwarded_proto = header_value(header_block, "x-forwarded-proto");
+      request.forwarded_for = header_value(header_block, "x-forwarded-for");
+      if (const std::size_t comma = request.forwarded_for.find(',');
+          comma != std::string::npos) {
+        request.forwarded_for.resize(comma);  // first hop only
+      }
+      over_tls = request.forwarded_proto == "https";
+    }
+  }
+  request.tls_verified = over_tls;
+
+  if (options_.tls.require_https && !over_tls && !tls_exempt_path(request.path)) {
+    health_.requests_rejected.fetch_add(1, std::memory_order_relaxed);
+    metrics_.inc_counter("vpn_http_requests_total",
+                         {{"route", std::string{canonical_route(request.path)}},
+                          {"method", std::string{canonical_method(request.method)}},
+                          {"status", "403"}});
+    metrics_.inc_counter("vpn_tls_required_total", {});
+    const std::string body =
+        std::string{R"({"type":"about:blank","title":"HTTPS Required","status":403,)"} +
+        R"("detail":"this endpoint is served over TLS by the edge proxy"})";
+    (void)send_all(fd, build_response(403, "application/problem+json", body, false));
+    shutdown_send(fd);
+    return;
+  }
+
   const HttpResponse response = route(request);
   const bool is_head = request.method == "HEAD";
+  std::string extra_headers;
+  if (over_tls && options_.tls.hsts) {
+    std::string hsts = "\r\nStrict-Transport-Security: max-age=";
+    hsts += std::to_string(options_.tls.hsts_max_age_secs);
+    hsts += "; includeSubDomains";
+    // Only over TLS: sending HSTS on a cleartext response is meaningless and a
+    // browser ignores it anyway.
+    extra_headers = std::move(hsts);
+  }
 
   health_.requests_total.fetch_add(1, std::memory_order_relaxed);
   // Label values come from a fixed vocabulary, never from the raw request: a
@@ -720,7 +874,7 @@ void HttpServer::handle_connection(std::intptr_t client_fd) {
                         {"status", std::to_string(response.status)}});
 
   (void)send_all(fd, build_response(response.status, response.content_type, response.body,
-                                   is_head));
+                                   is_head, extra_headers));
   // Half-close, then discard the rest of the request body before closing.
   // Closing a socket with unread input makes the stack send RST, and a peer that
   // receives RST throws away the response it had already buffered, so the client

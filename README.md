@@ -5,8 +5,8 @@ build and run; interop with the official WireGuard client is the one gate not ye
 executed (run `scripts/interop-test.sh`).**
 `vpn-dp` is a runnable tunnel server (Noise_IK handshake, per-peer keys, TUN on
 Linux, SIGHUP reload); `vpnd` serves the REST control plane (`/api/v1`) backed by a
-file store, so no database is required. Not implemented: TLS termination (use a
-proxy), PostgreSQL adapter, billing. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
+file store, so no database is required. TLS is terminated by an edge proxy with
+vpn-side enforcement ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md)) and `vpnctl` drives the API. Not implemented: PostgreSQL adapter, gRPC CP->DP, billing. See [`docs/ROADMAP.md`](docs/ROADMAP.md) and
 [`docs/INTEROP.md`](docs/INTEROP.md).
 
 The intended product is a multi-tenant VPN backend in modern C++: a userspace
@@ -26,8 +26,9 @@ and telemetry.
 | Server — control plane (`vpnd`) | C++20 | **implemented** — REST `/api/v1`, file-backed store, worker pool, `/healthz` `/readyz` `/metrics` on separate ports, `SIGHUP`, `/debug` |
 | Control-plane API (`/api/v1`) | C++20 | **implemented** — auth, devices, peers, config issuance, node catalog (see `docs/API.md` §0.1) |
 | Interop | — | **independently verified**: an independent Python implementation completes handshake + transport (`scripts/interop-local.ps1`); official `wg-quick` run pending on Linux (`scripts/interop-test.sh`) |
-| TLS termination | — | not implemented — terminate at a proxy |
-| PostgreSQL adapter, gRPC CP→DP, billing, `vpnctl` | — | not implemented (next increments) |
+| TLS termination | — | **implemented as the edge-proxy contract**: `tls.terminated_by_proxy` + `tls.require_https` (403 for plaintext, fails closed), HSTS, trusted-proxy CIDRs, nginx/Caddy configs ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md)) |
+| `vpnctl` | — | **implemented and verified end-to-end** (`login -> nodes add -> devices -> set-key -> peers -> config -> delete`) |
+| PostgreSQL adapter, gRPC CP→DP, billing | — | not implemented (next increments) |
 | Android client | Kotlin | Folder placeholder only (`android/`) |
 | iOS client | Swift | Folder placeholder only (`ios/`) |
 
@@ -53,9 +54,9 @@ Reproduce with `pwsh -File scripts/build-local.ps1 -Jobs 1`.
 
 * Interop with the official WireGuard client is **not yet executed** — the one gate
   self-consistency cannot prove (`docs/INTEROP.md`).
-* No TLS in the binary: run `vpnd` behind nginx/caddy/LB (`docs/DEPLOYMENT.md`).
+* No TLS stack in the binary by design: terminate TLS at nginx/caddy/LB and set `tls.terminated_by_proxy`/`tls.require_https` ([ADR-0009](docs/DECISIONS/ADR-0009-tls-at-the-edge.md), `deploy/nginx/vpn.conf`).
 * TUN forwarding is Linux-only; other platforms run handshake-only.
-* No PostgreSQL adapter, no gRPC CP→DP channel, no billing, no `vpnctl`.
+* No PostgreSQL adapter, no gRPC CP->DP channel, no billing yet.
 
 ### Now implemented (previously listed as missing)
 

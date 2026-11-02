@@ -42,6 +42,11 @@ struct HttpRequest {
   std::string client_port{};  // as text, for rate limiting / logging
   std::string body{};         // bounded request body (max 8 KiB), for the REST layer
   std::string authorization{};  // raw Authorization header value, if present
+  // Only trusted when client_ip is inside `Options::tls.trusted_proxies`; an
+  // untrusted peer cannot talk its way into "https" by sending these.
+  std::string forwarded_proto{};  // X-Forwarded-Proto, lower-cased
+  std::string forwarded_for{};    // X-Forwarded-For (first hop), for audit logs
+  bool tls_verified{false};       // set by the server once the TLS policy passes
 };
 
 struct HttpResponse {
@@ -77,6 +82,16 @@ class HttpServer {
     bool dev_mode{false};
     std::uint32_t max_concurrent_connections{64};
     std::string service_name{"vpnd"};
+    // TLS termination policy. Kept as plain data so the HTTP layer does not
+    // depend on the config module (and so tests can set it directly).
+    struct TlsPolicy {
+      bool require_https{false};
+      bool hsts{false};
+      std::uint32_t hsts_max_age_secs{31536000};
+      // CIDRs whose X-Forwarded-Proto is believed. Empty => never believed.
+      std::vector<std::string> trusted_proxies{};
+    };
+    TlsPolicy tls{};
   };
 
   HttpServer(Options options, HealthState& health, obs::Metrics& metrics);

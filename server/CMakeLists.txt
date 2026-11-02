@@ -55,6 +55,18 @@ if(VPN_BUILD_CONTROLPLANE)
   endif()
 endif()
 
+if(VPN_BUILD_CONTROLPLANE)
+  # Operator/client CLI: a plain HTTP client, so it depends on vpn_core only.
+  add_executable(vpnctl cli/main.cpp)
+  target_link_libraries(vpnctl PRIVATE vpn_core)
+  if(WIN32)
+    target_link_libraries(vpnctl PRIVATE ws2_32)
+  endif()
+  if(UNIX)
+    target_link_options(vpnctl PRIVATE -Wl,-z,relro,-z,now)
+  endif()
+endif()
+
 if(VPN_BUILD_DATAPLANE)
   add_executable(vpn-dp src/dataplane/main.cpp)
   target_link_libraries(vpn-dp PRIVATE vpn_core)

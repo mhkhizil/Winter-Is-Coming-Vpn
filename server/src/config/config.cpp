@@ -49,6 +49,29 @@ namespace {
   return true;
 }
 
+// `["10.0.0.0/8", "172.16.0.0/12"]`, `10.0.0.0/8,172.16.0.0/12`, or "" for none.
+// Both spellings appear in the wild, so accept both rather than fail a deploy on
+// a bracketed list.
+[[nodiscard]] std::vector<std::string> parse_string_list(std::string_view raw) {
+  std::string text{raw};
+  if (!text.empty() && text.front() == '[') text.erase(0, 1);
+  if (!text.empty() && text.back() == ']') text.pop_back();
+
+  std::vector<std::string> out;
+  std::size_t start = 0;
+  while (start <= text.size()) {
+    const std::size_t comma = text.find(',', start);
+    const std::string_view item =
+        comma == std::string::npos ? std::string_view{text}.substr(start)
+                                   : std::string_view{text}.substr(start, comma - start);
+    std::string cleaned = unquote(trim(item));
+    if (!cleaned.empty()) out.push_back(std::move(cleaned));
+    if (comma == std::string::npos) break;
+    start = comma + 1;
+  }
+  return out;
+}
+
 // vpnd reads its environment once, before any thread is started.
 [[nodiscard]] const char* env(const char* name) noexcept {
 #if defined(_WIN32)
@@ -129,6 +152,16 @@ Result<ServerConfig> parse(std::string_view text) {
       cfg.tls.key_file = value;
     } else if (qualified == "tls.client_ca_file") {
       cfg.tls.client_ca_file = value;
+    } else if (qualified == "tls.terminated_by_proxy") {
+      if (!parse_bool(value, cfg.tls.terminated_by_proxy)) return fail("expected a boolean");
+    } else if (qualified == "tls.require_https") {
+      if (!parse_bool(value, cfg.tls.require_https)) return fail("expected a boolean");
+    } else if (qualified == "tls.hsts") {
+      if (!parse_bool(value, cfg.tls.hsts)) return fail("expected a boolean");
+    } else if (qualified == "tls.hsts_max_age_secs") {
+      if (!parse_u32(value, cfg.tls.hsts_max_age_secs)) return fail("expected a number");
+    } else if (qualified == "tls.trusted_proxies") {
+      cfg.tls.trusted_proxies = parse_string_list(value);
     } else if (qualified == "rate_limit.requests_per_second") {
       if (!parse_u32(value, cfg.rate_limit.requests_per_second)) return fail("expected a number");
     } else if (qualified == "rate_limit.burst") {
@@ -172,6 +205,21 @@ Status apply_environment(ServerConfig& cfg) {
   if (const char* v = env("VPN_TLS_CERT_FILE")) cfg.tls.cert_file = v;
   if (const char* v = env("VPN_TLS_KEY_FILE")) cfg.tls.key_file = v;
   if (const char* v = env("VPN_TLS_CLIENT_CA_FILE")) cfg.tls.client_ca_file = v;
+  if (const char* v = env("VPN_TLS_TERMINATED_BY_PROXY")) {
+    bool parsed = false;
+    if (parse_bool(v, parsed)) cfg.tls.terminated_by_proxy = parsed;
+  }
+  if (const char* v = env("VPN_TLS_REQUIRE_HTTPS")) {
+    bool parsed = false;
+    if (parse_bool(v, parsed)) cfg.tls.require_https = parsed;
+  }
+  if (const char* v = env("VPN_TLS_HSTS")) {
+    bool parsed = false;
+    if (parse_bool(v, parsed)) cfg.tls.hsts = parsed;
+  }
+  if (const char* v = env("VPN_TLS_TRUSTED_PROXIES")) {
+    cfg.tls.trusted_proxies = parse_string_list(v);
+  }
   return Status{};
 }
 
@@ -197,8 +245,34 @@ Status validate(const ServerConfig& cfg) {
     return Status{ErrorCode::kInvalidArgument,
                   "tls.cert_file and tls.key_file must be set together"};
   }
-  if (cfg.environment == "production" && cfg.tls.cert_file.empty()) {
-    return Status{ErrorCode::kInvalidArgument, "TLS is required in production"};
+  if (cfg.tls.require_https && !cfg.tls.terminated_by_proxy) {
+    return Status{ErrorCode::kInvalidArgument,
+                  "tls.require_https needs tls.terminated_by_proxy: vpnd cannot detect TLS "
+                  "on its own socket"};
+  }
+  if (cfg.tls.terminated_by_proxy && !cfg.tls.cert_file.empty()) {
+    return Status{ErrorCode::kInvalidArgument,
+                  "set either tls.terminated_by_proxy or tls.cert_file/key_file, not both"};
+  }
+  if (cfg.tls.hsts && !cfg.tls.terminated_by_proxy) {
+    return Status{ErrorCode::kInvalidArgument,
+                  "tls.hsts needs tls.terminated_by_proxy (it is only emitted on "
+                  "requests the proxy marked as https)"};
+  }
+  for (const std::string& spec : cfg.tls.trusted_proxies) {
+    // A typo here would make X-Forwarded-Proto forgeable by every client, which
+    // silently defeats tls.require_https.
+    if (spec == "0.0.0.0/0" || spec == "::/0" || spec == "0/0") {
+      return Status{ErrorCode::kInvalidArgument,
+                    "tls.trusted_proxies must not be a wildcard (0.0.0.0/0): that would "
+                    "let any client forge X-Forwarded-Proto"};
+    }
+  }
+  if (cfg.environment == "production" && !cfg.tls.terminated_by_proxy &&
+      cfg.tls.cert_file.empty()) {
+    return Status{ErrorCode::kInvalidArgument,
+                  "TLS is required in production: set tls.terminated_by_proxy = true and "
+                  "tls.require_https = true, and terminate TLS at the edge proxy"};
   }
   // The dev bootstrap token must never be a short, guessable string; empty means
   // "unset", which is the normal production state (JWT/OIDC only).
@@ -221,6 +295,12 @@ std::string to_string(const ServerConfig& cfg) {
       << "[tls]\ncert_file = \"" << cfg.tls.cert_file << "\"\n"
       << "key_file = \"" << (cfg.tls.key_file.empty() ? "" : "<redacted>") << "\"\n"
       << "client_ca_file = \"" << cfg.tls.client_ca_file << "\"\n"
+      << "terminated_by_proxy = " << (cfg.tls.terminated_by_proxy ? "true" : "false") << "\n"
+      << "require_https = " << (cfg.tls.require_https ? "true" : "false") << "\n"
+      << "hsts = " << (cfg.tls.hsts ? "true" : "false") << "\n"
+      << "trusted_proxies = \""
+      << (cfg.tls.trusted_proxies.empty() ? "<none>" : cfg.tls.trusted_proxies.front())
+      << (cfg.tls.trusted_proxies.size() > 1 ? ",..." : "") << "\"\n"
       << "admin_token = \"" << (cfg.admin_token.empty() ? "" : "<redacted>") << "\"\n";
   return out.str();
 }

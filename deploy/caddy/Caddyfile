@@ -1,0 +1,61 @@
+# Copyright 2026 The vpn authors. SPDX-License-Identifier: Apache-2.0
+#
+# Caddy alternative to deploy/nginx/vpn.conf (ADR-0009). Caddy is the better
+# choice when you want HTTP/3, automatic certificates and no OCSP configuration:
+# it obtains and renews TLS certificates on its own.
+#
+#   caddy run --config deploy/caddy/Caddyfile
+#
+# vpnd must be started with [tls] terminated_by_proxy = true, require_https = true
+# and trusted_proxies = ["127.0.0.1/32"] (Caddy connects from loopback).
+
+{
+	# Replace with your ACME account address.
+	email ops@example.com
+	# Caddy terminates TLS and speaks HTTP/1.1 to the backend. It sets
+	# X-Forwarded-Proto itself and never trusts a client-supplied one.
+	servers {
+		protocols h1 h2 h3
+	}
+}
+
+vpn.example.com {
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000; includeSubDomains"
+		-Server
+	}
+
+	handle /api/v1/auth/login {
+		rate_limit {
+			zone login {
+				key {remote_host}
+				events 10
+				window 1m
+			}
+		}
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle /api/* {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle /healthz {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	handle /readyz {
+		reverse_proxy 127.0.0.1:8080
+	}
+
+	# The metrics listener is deliberately a different port; never publish it.
+	handle /metrics {
+		respond 404
+	}
+
+	handle {
+		respond 404
+	}
+}

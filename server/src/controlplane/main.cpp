@@ -218,6 +218,13 @@ int main(int argc, char** argv) {
   api_options.max_concurrent_connections = cfg.http.max_connections;
   api_options.dev_mode = cfg.dev_mode;
   api_options.service_name = "vpnd";
+  // TLS is terminated by the edge proxy (ADR-0009); these three knobs decide how
+  // strictly we believe it. `require_https` turns a plaintext request that did not
+  // come through the proxy into a 403 instead of a silent cleartext API.
+  api_options.tls.require_https = cfg.tls.require_https;
+  api_options.tls.hsts = cfg.tls.hsts;
+  api_options.tls.hsts_max_age_secs = cfg.tls.hsts_max_age_secs;
+  api_options.tls.trusted_proxies = cfg.tls.trusted_proxies;
 
   // Install the handlers before the socket exists: a SIGTERM in the window
   // between listen() and serve() would otherwise take the default action.
