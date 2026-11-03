@@ -512,7 +512,20 @@ Result<std::unique_ptr<Store>> Store::open(const StoreOptions& options) {
     const char* email = std::getenv("VPN_BOOTSTRAP_EMAIL");
     const char* password = std::getenv("VPN_BOOTSTRAP_PASSWORD");
     if (email != nullptr && password != nullptr) {
-      const Status seeded = store->add_user(email, password, "owner");
+      // The role matters more than it looks. Every /api/v1/admin/* endpoint and
+      // /api/v1/dp/config require role "admin", and on a fresh store this is the only
+      // account that exists - so hardcoding "owner" left a new deployment with nobody
+      // able to administer it (owner is deliberately not an administrator, because it is
+      // the role a self-service customer gets). The default stays "owner" so a box never
+      // comes up with admin access by accident; an operator who needs to administer it
+      // sets VPN_BOOTSTRAP_ROLE=admin for the first start.
+      const char* role_env = std::getenv("VPN_BOOTSTRAP_ROLE");
+      const std::string role = (role_env != nullptr && *role_env != '\0') ? role_env : "owner";
+      if (role != "user" && role != "admin" && role != "owner") {
+        return make_error(ErrorCode::kInvalidArgument,
+                          "VPN_BOOTSTRAP_ROLE must be one of user, admin, owner");
+      }
+      const Status seeded = store->add_user(email, password, role);
       if (!seeded) return seeded;
     }
   }

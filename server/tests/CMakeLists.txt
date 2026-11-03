@@ -16,7 +16,8 @@ add_executable(vpn_unit_tests
   unit/test_ct.cpp
   unit/test_config.cpp
   unit/test_kdf.cpp
-  unit/test_metrics.cpp)
+  unit/test_metrics.cpp
+  unit/test_store_bootstrap.cpp)
 
 target_link_libraries(vpn_unit_tests PRIVATE vpn_core)
 target_include_directories(vpn_unit_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/unit")

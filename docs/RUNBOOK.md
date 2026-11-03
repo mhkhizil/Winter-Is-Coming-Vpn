@@ -49,6 +49,31 @@ unready, which is the intended gate for load balancers.
 There is **no** hot reload: `systemctl reload vpnd` does nothing because
 `vpnd.service` deliberately omits `ExecReload`. Restart to apply config.
 
+### 1.1 Creating the first account (and the first administrator)
+
+On an empty store, `vpnd` seeds exactly one account from the environment:
+
+```sh
+VPN_BOOTSTRAP_EMAIL=ops@example.com
+VPN_BOOTSTRAP_PASSWORD=<at least 8 characters>
+VPN_BOOTSTRAP_ROLE=admin        # user | admin | owner; defaults to "owner"
+```
+
+`owner` is **not** an administrator: it is the role a self-service customer gets, and
+`/api/v1/admin/*` plus `/api/v1/dp/config` answer `403` to it. So a deployment that needs
+to administer itself (create customers, grant time, run reminders, serve the node peer
+table) must set `VPN_BOOTSTRAP_ROLE=admin` on the **first** start, while the store is still
+empty. The default stays `owner` on purpose: a box should never come up with admin access
+because someone forgot to set a variable.
+
+There is no API to promote the first account afterwards, by design — an unauthenticated
+"make me an admin" endpoint is a backdoor. If you bootstrapped an `owner` by mistake,
+stop `vpnd`, delete the `U`/`T`/`A` lines for that account from the store log (or start
+from an empty store), and start again with `VPN_BOOTSTRAP_ROLE=admin`.
+
+A nonsense value (`administrator`, `root`) is refused at startup — `vpnd` fails to open
+the store and exits `3` (runtime error) rather than storing a role nobody checks.
+
 ## 2. A node is not taking new sessions — [M3]
 
 1. `vpnctl node list` → look at `status` (`degraded`/`draining`/`disabled`).
