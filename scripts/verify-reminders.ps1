@@ -37,8 +37,29 @@ port = $SmtpPort
 from = "vpn@example.invalid"
 "@ | Set-Content -Path $conf -Encoding ascii
 
-Start-Process -FilePath 'python' -WindowStyle Hidden -ArgumentList ('"' + (Join-Path $root 'scripts/fake_smtp.py') + '" --port ' + $SmtpPort + ' --outdir "' + $maildir + '"')
-Start-Sleep -Seconds 1
+$sinkLog = Join-Path $work 'sink.log'
+$sinkErr = Join-Path $work 'sink.err'
+$sink = Start-Process -FilePath 'python' -PassThru -WindowStyle Hidden `
+    -RedirectStandardOutput $sinkLog -RedirectStandardError $sinkErr `
+    -ArgumentList ('"' + (Join-Path $root 'scripts/fake_smtp.py') + '" --port ' + $SmtpPort + ' --outdir "' + $maildir + '"')
+
+# Wait for the capture server to actually be listening instead of sleeping a fixed
+# second: a slow start used to leave vpnd talking to nothing.
+$listening = $false
+for ($i = 0; $i -lt 40; $i++) {
+    Start-Sleep -Milliseconds 100
+    if (Get-NetTCPConnection -LocalPort $SmtpPort -State Listen -ErrorAction SilentlyContinue) {
+        $listening = $true
+        break
+    }
+    if ($sink.HasExited) { break }
+}
+if (-not $listening) {
+    Write-Host 'FAIL: the SMTP capture server never listened'
+    if (Test-Path $sinkErr) { Get-Content $sinkErr | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" } }
+    if (-not $sink.HasExited) { Stop-Process -Id $sink.Id -Force }
+    exit 1
+}
 $env:VPN_STORE_PATH = $store
 $env:VPN_API = "http://127.0.0.1:$ApiPort"
 $env:VPN_TOKEN_FILE = Join-Path $work 'admin.token'
@@ -54,14 +75,28 @@ $second = & $ctl admin remind --days 7
 Write-Host "first run : $first"
 Write-Host "second run: $second"
 
-$mails = @(Get-ChildItem $maildir -Filter '*.eml' -ErrorAction SilentlyContinue)
+$mails = @()
+for ($i = 0; $i -lt 30; $i++) {
+    $mails = @(Get-ChildItem $maildir -Filter '*.eml' -ErrorAction SilentlyContinue)
+    if ($mails.Count -gt 0) { break }
+    Start-Sleep -Milliseconds 100
+}
 $body = if ($mails.Count -gt 0) { Get-Content $mails[0].FullName -Raw } else { '' }
 $addressed = $body -match 'To: ali@example\.invalid'
 $textOk = $body -match 'ends in 7 day\(s\)'
 Write-Host ("mails={0} addressed={1} text_ok={2}" -f $mails.Count, $addressed, $textOk)
+if ($mails.Count -eq 0 -and (Test-Path $sinkLog)) {
+    # When nothing was captured, the sink's own log is the only evidence of whether it
+    # was ever contacted.
+    Write-Host 'sink log:'
+    Get-Content $sinkLog | Select-Object -Last 5 | ForEach-Object { Write-Host "  $_" }
+    Get-Content $sinkErr -ErrorAction SilentlyContinue | Select-Object -Last 5 | ForEach-Object { Write-Host "  $_" }
+}
 
 Get-Process vpnd -ErrorAction SilentlyContinue | Stop-Process -Force
-Get-Process python -ErrorAction SilentlyContinue | Where-Object { $_.MainWindowTitle -eq '' } | Stop-Process -Force -ErrorAction SilentlyContinue
+# Only the sink this script started: the previous version killed every python.exe on the
+# machine, which is a nasty thing for a verification script to do.
+if (-not $sink.HasExited) { Stop-Process -Id $sink.Id -Force -ErrorAction SilentlyContinue }
 
 $sentOnce = $first -match '"sent":1'
 $idempotent = $second -match '"sent":0'

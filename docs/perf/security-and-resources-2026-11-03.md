@@ -98,8 +98,37 @@ is policy, not a defect — the probe reuses device names across rounds.
 | Area | Why | Where it can run |
 |---|---|---|
 | Android runtime: leaks, jank, private-key lifetime | no emulator (no hypervisor on Win11 Home) and no device | CI instrumented lane, or a physical phone |
-| Data plane leak/throughput re-measurement | `vpn-dp.exe` is blocked by Windows Smart App Control on this host (blocked even when copied elsewhere) | Linux VPS / the CI sanitizer lane |
 | Real TUN forwarding, official `wg` interop | needs `CAP_NET_ADMIN` and a real interface | `scripts/interop-test.sh` on a VPS |
+
+### Addendum: the data-plane suites, previously blocked, now run
+
+`vpn-dp.exe` was being refused by Windows Smart App Control — but only that one stale
+binary: a fresh build of the same source from the same toolchain runs fine. Reconfiguring
+`out/build-dp` with `-DVPN_BUILD_DATAPLANE=ON` (and the zig `ar`/`ranlib` shims, which is
+what a naive fresh configure misses: without them CMake reports `CMAKE_AR-NOTFOUND`) made
+the whole data-plane matrix runnable again on this host:
+
+| Suite | Result |
+|---|---|
+| `scripts/interop-local.ps1` | **PASS** — independent implementation: handshake ok, 4 transport packets accepted, 32-byte inner payload |
+| `scripts/verify-cp-dp-pull.ps1` | **PASS** — vpn-dp fetched its peer table from vpnd and served a real handshake |
+| `scripts/verify-dp-batching.ps1` | **PASS** — every queued datagram of every batch accepted, no drops |
+| `scripts/verify-access-expiry.ps1` | **PASS** — lapsed peer refused, paid-up and staff peers accepted |
+| `scripts/verify-reminders.ps1` | **PASS** after a harness fix (below) |
+| `scripts/verify-security.ps1` | **PASS** 5/5 |
+| `scripts/verify-log-injection.ps1` | **PASS** |
+
+`verify-reminders.ps1` was failing for a reason worth recording: vpnd reported
+`sent: 1` while the capture server's directory was still empty, because the assertion ran
+before the sink had written the message. The script now waits for the sink to be
+*listening* before starting vpnd, polls for the `.eml` instead of reading the directory
+once, and stops only the sink process it started — the old version did
+`Get-Process python | Stop-Process`, which killed every Python process on the machine,
+including whatever the person running the verification happened to be doing.
+
+So the honest status is: the data plane has now forwarded packets on this host, but still
+not through a real TUN interface — that part needs `CAP_NET_ADMIN` on Linux.
+
 
 Static review of the client is in progress separately and is not folded into this
 document yet; it is a code-reading exercise, not a measurement.
