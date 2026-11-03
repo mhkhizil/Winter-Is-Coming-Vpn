@@ -688,10 +688,15 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
         return problem(missing ? 404 : 422, missing ? "Not Found" : "Unprocessable Entity",
                        "config_unsupported", peer.error().message());
       }
-      return json(201, "{\"id\":\"" + escape(peer->id) + "\",\"device_id\":\"" +
-                           escape(peer->device_id) + "\",\"addresses\":[\"" + escape(peer->ipv4) +
-                           "/32\",\"" + escape(peer->ipv6) + "/128\"],\"status\":\"" +
-                           escape(peer->status) + "\"}");
+      // Answer with the structured configuration (docs/CLIENT_INTEGRATION.md §2):
+      // a front end gets identity, interface and server details in one response
+      // instead of three round-trips plus a TOML parser. `id` is kept alongside
+      // `peer_id` so existing callers keep working.
+      const auto payload = options_.store->render_client_json(who, peer->id);
+      if (!payload) {
+        return problem(500, "Internal Server Error", "internal", payload.error().message());
+      }
+      return json(201, *payload);
     }
     if (request.method == "GET" && parts.size() == 3) {
       auto peers = options_.store->list_peers(who);

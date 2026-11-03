@@ -92,6 +92,13 @@ struct StoreOptions {
   std::string server_ipv4{"10.66.0.1"};
   std::string server_ipv6{"fd00:66::1"};
   std::string ipv6_block{"fd00:66::/64"};
+  // Client tunnel parameters. Configurable because they depend on the deployment:
+  // MTU must fit the path (WireGuard overhead is 80 bytes over IPv4), and AllowedIPs
+  // decides whether IPv6 is carried at all - advertising ::/0 while the data plane
+  // cannot forward IPv6 blackholes every v6 connection on the device.
+  std::uint16_t mtu{1420};
+  std::string client_allowed_ips{"0.0.0.0/0, ::/0"};
+  std::uint16_t persistent_keepalive{25};
 };
 
 class Store {
@@ -202,6 +209,12 @@ class Store {
   // wg-quick compatible text. The private key is intentionally absent: the client
   // generates it (ADR-0007).
   [[nodiscard]] Result<std::string> render_client_conf(const Principal& principal,
+                                                       std::string_view peer_id) const;
+
+  // The same configuration as structured JSON - the shape docs/CLIENT_INTEGRATION.md
+  // promises to app developers, so a front end never has to parse TOML. The private
+  // key is deliberately absent (ADR-0007): the client generates it.
+  [[nodiscard]] Result<std::string> render_client_json(const Principal& principal,
                                                        std::string_view peer_id) const;
 
   [[nodiscard]] const StoreOptions& options() const noexcept { return options_; }

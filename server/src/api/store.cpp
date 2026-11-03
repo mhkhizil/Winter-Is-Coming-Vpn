@@ -775,11 +775,11 @@ Result<std::string> Store::render_client_conf(const Principal& principal,
   conf += "# PrivateKey = <generate locally: wg genkey | tee privatekey | wg pubkey>\n";
   conf += "Address = " + it->second.ipv4 + "/32, " + it->second.ipv6 + "/128\n";
   conf += "DNS = " + options_.dns + "\n";
-  conf += "MTU = 1420\n\n[Peer]\n";
+  conf += "MTU = " + std::to_string(options_.mtu) + "\n\n[Peer]\n";
   conf += "PublicKey = " + server_key + "\n";
   conf += "Endpoint = " + node.host + ":" + std::to_string(node.port) + "\n";
-  conf += "AllowedIPs = 0.0.0.0/0, ::/0\n";
-  conf += "PersistentKeepalive = 25\n";
+  conf += "AllowedIPs = " + options_.client_allowed_ips + "\n";
+  conf += "PersistentKeepalive = " + std::to_string(options_.persistent_keepalive) + "\n";
   return conf;
 }
 
@@ -1086,6 +1086,75 @@ Result<std::string> Store::render_dp_config(const Principal& actor,
     ++peers;
   }
   if (peers == 0) out += "\n# no active peers yet\n";
+  return out;
+}
+
+// The structured form of render_client_conf(). This is the payload a front end
+// consumes: no TOML parsing, no base64-vs-hex guessing, and an explicit
+// "private_key": null so a client cannot accidentally expect one from us (ADR-0007).
+Result<std::string> Store::render_client_json(const Principal& principal,
+                                              std::string_view peer_id) const {
+  const std::lock_guard<std::mutex> lock(mutex_);
+  const auto it = peers_.find(std::string{peer_id});
+  if (it == peers_.end()) return make_error(ErrorCode::kNotFound, "no such peer");
+  const auto device_it = devices_.find(it->second.device_id);
+  if (device_it == devices_.end() || device_it->second.user_id != principal.user_id) {
+    return make_error(ErrorCode::kNotFound, "no such peer");
+  }
+  if (it->second.status != "active") {
+    return make_error(ErrorCode::kPermissionDenied, "peer is revoked");
+  }
+  if (!access_active_locked(principal.user_id)) {
+    return make_error(ErrorCode::kPermissionDenied,
+                      "access expired or revoked: an administrator must extend it");
+  }
+  if (nodes_.empty()) {
+    return make_error(ErrorCode::kUnavailable, "no node registered: POST /api/v1/nodes first");
+  }
+  const NodeInfo& node = nodes_.front();
+  const std::string server_key = base64_of_hex(node.public_key_hex);
+  if (server_key.empty()) {
+    return make_error(ErrorCode::kInternal, "node public key is corrupt");
+  }
+
+  // AllowedIPs is a comma-separated string in the config; a client wants a list.
+  std::string allowed;
+  std::string current;
+  const auto flush_allowed = [&allowed, &current]() {
+    std::size_t begin = current.find_first_not_of(" \t");
+    std::size_t end = current.find_last_not_of(" \t");
+    if (begin != std::string::npos) {
+      allowed += (allowed.empty() ? "" : ",") + std::string{"\""} +
+                 current.substr(begin, end - begin + 1) + "\"";
+    }
+    current.clear();
+  };
+  for (const char c : options_.client_allowed_ips) {
+    if (c == ',') {
+      flush_allowed();
+    } else {
+      current.push_back(c);
+    }
+  }
+  flush_allowed();
+
+  std::string out = "{\"id\":\"" + it->second.id + "\"";
+  out += ",\"peer_id\":\"" + it->second.id + "\"";
+  out += ",\"device_id\":\"" + it->second.device_id + "\"";
+  out += ",\"status\":\"" + it->second.status + "\"";
+  out += ",\"interface\":{";
+  out += "\"addresses\":[\"" + it->second.ipv4 + "/32\",\"" + it->second.ipv6 + "/128\"]";
+  out += ",\"dns\":[\"" + options_.dns + "\"]";
+  out += ",\"mtu\":" + std::to_string(options_.mtu);
+  out += ",\"persistent_keepalive\":" + std::to_string(options_.persistent_keepalive);
+  // Deliberately null: the client generates and keeps its own private key.
+  out += ",\"private_key\":null}";
+  out += ",\"server\":{";
+  out += "\"id\":\"" + node.id + "\"";
+  out += ",\"endpoint\":\"" + node.host + ":" + std::to_string(node.port) + "\"";
+  out += ",\"public_key\":\"" + server_key + "\"";
+  out += ",\"allowed_ips\":[" + allowed + "]}";
+  out += "}";
   return out;
 }
 

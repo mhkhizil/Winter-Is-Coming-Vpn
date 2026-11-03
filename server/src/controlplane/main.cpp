@@ -255,6 +255,20 @@ int main(int argc, char** argv) {
       endpoint_host == nullptr ? std::string{"127.0.0.1"} : endpoint_host;
   const char* dns = std::getenv("VPN_DNS");
   if (dns != nullptr) store_options.dns = dns;
+  // Client tunnel parameters. VPN_ALLOWED_IPS is the IPv6 go/no-go switch: set it
+  // to "0.0.0.0/0" to ship IPv4-only rather than advertise ::/0 that the data
+  // plane cannot forward.
+  if (const char* mtu = std::getenv("VPN_MTU")) {
+    const long parsed = std::strtol(mtu, nullptr, 10);
+    if (parsed >= 576 && parsed <= 9000) store_options.mtu = static_cast<std::uint16_t>(parsed);
+  }
+  if (const char* allowed = std::getenv("VPN_ALLOWED_IPS")) store_options.client_allowed_ips = allowed;
+  if (const char* keepalive = std::getenv("VPN_KEEPALIVE")) {
+    const long parsed = std::strtol(keepalive, nullptr, 10);
+    if (parsed >= 0 && parsed <= 65535) {
+      store_options.persistent_keepalive = static_cast<std::uint16_t>(parsed);
+    }
+  }
 
   auto store = vpn::api::Store::open(store_options);
   if (!store) {
