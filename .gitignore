@@ -99,7 +99,8 @@ AWS_*
 /var/
 /tmp/
 
-# --- Kotlin / Android (future client) -------------------------------------
+# --- Kotlin / Android: the client now lives in its own repository -----------
+# (github.com/mhkhizil/VPN-Fe-Android). Rules kept so a stray checkout stays ignored.
 .gradle/
 local.properties
 *.iml

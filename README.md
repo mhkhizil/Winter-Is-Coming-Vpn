@@ -32,7 +32,7 @@ and telemetry.
 | Renewal reminders | — | **implemented**: `vpnctl admin remind` (idempotent, cron-able) over plain SMTP to a local relay; `scripts/verify-reminders.ps1` ([ADR-0011](docs/DECISIONS/ADR-0011-reminders-and-peer-pull.md)) |
 | CP→DP config channel | — | **implemented**: `vpn-dp --config-url` pulls its peer table over HTTP in the TOML it already parses; verified with a real handshake ([ADR-0011](docs/DECISIONS/ADR-0011-reminders-and-peer-pull.md)) |
 | PostgreSQL adapter | — | not implemented (next increment) |
-| Android client | Kotlin | Folder placeholder only (`android/`) |
+| Android client | Kotlin | Separate repository: **[VPN-Fe-Android](https://github.com/mhkhizil/VPN-Fe-Android)** |
 | iOS client | Swift | Folder placeholder only (`ios/`) |
 
 Build status: Release, `-Werror`, clang 21 (via zig 0.16) — **0 warnings, 2/2 test
@@ -79,14 +79,13 @@ Reproduce with `pwsh -File scripts/build-local.ps1 -Jobs 1`.
 ```
 docs/      Architecture, protocol, threat model, data model, API, runbooks, ADRs  <-- start here
 server/    C++20 server: wire core, control plane, migrations (data plane is M2/empty)
-android/   Kotlin client (placeholder)
 ios/       Swift client (placeholder)
 deploy/    compose, Dockerfiles, systemd units (Helm/Terraform/Ansible are empty placeholders)
 scripts/   Developer bootstrap, seed, docs lint (demo/ is empty)
 ```
 
 > `deploy/helm`, `deploy/terraform`, `deploy/ansible`, `deploy/secrets` and the
-> `android/`, `ios/` trees contain nothing but `.gitkeep`/README placeholders.
+> The Android client lives in its own repository ([VPN-Fe-Android](https://github.com/mhkhizil/VPN-Fe-Android)); this repository is the server only. `ios/` here is still a placeholder.
 
 ## Read first
 

@@ -3,6 +3,15 @@
 **Status:** accepted (2026-11-02)
 **Context:** the first front end is an Android app (milestone M5 of the roadmap).
 
+> **Repository note (2026-11-02).** The Android client lives in its own repository,
+> **[mhkhizil/VPN-Fe-Android](https://github.com/mhkhizil/VPN-Fe-Android)**, not in
+> this one. This ADR still applies: it is the reason that repository embeds the
+> official tunnel library, and the reason its `TunnelEngine` seam exists so that an
+> in-house tunnel (built from this repository's `server/src/wire`) can replace the
+> library later. Server and client ship on different cadences, so they are versioned
+> and released separately.
+
+
 ## Context
 
 We have a portable, tested C++ WireGuard implementation in this repository

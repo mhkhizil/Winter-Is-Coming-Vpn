@@ -1,3 +1,14 @@
+> **Repository split (2026-11-02).** The Android client is no longer in this
+> repository: it lives at
+> **[mhkhizil/VPN-Fe-Android](https://github.com/mhkhizil/VPN-Fe-Android)** and is
+> built from its own CI. Where this document says "Android (`android/`)", read "the
+> separate Android repository"; the contract below is unchanged and is still the
+> server's promise to it. `ios/` in this repository is still a placeholder.
+> The client repo has `app/src/test/.../PeerConfigParserTest.kt`, which fails when
+> the `POST /api/v1/peers` payload below changes — that test is the contract's
+> enforcement mechanism, not this prose.
+
+
 # Client integration contract (Android / iOS)
 
 Status: **draft-1**. Android (`android/`) and iOS (`ios/`) are **folder
