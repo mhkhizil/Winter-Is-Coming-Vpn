@@ -182,11 +182,94 @@ Store::~Store() {
   }
 }
 
+// The store log is a tab-separated, newline-terminated record format, and several
+// fields come from users: an email, a device name, a node host, a plan label. A field
+// containing a raw tab or newline therefore cannot be written as-is:
+//
+//   D <id> <user> <name> <platform> <key>
+//
+// with name = "innocent\nU\tusr_x\tten\tpwn@evil\t<hash>\tadmin" rewrites the log into
+// a *forged account*, and replay then treats it as real. That was a working privilege
+// escalation (any authenticated user -> admin, surviving restart), not a theoretical
+// one. Percent-escaping the four dangerous bytes on the way out, and undoing it per
+// field on the way in, closes it for every record kind at once - including ones added
+// later.
+constexpr std::string_view kEscapePercent = "%25";
+constexpr std::string_view kEscapeTab = "%09";
+constexpr std::string_view kEscapeNewline = "%0A";
+constexpr std::string_view kEscapeCarriageReturn = "%0D";
+
+// Escapes a whole record while preserving the tabs that delimit its fields.
+[[nodiscard]] std::string escape_record(std::string_view line) {
+  std::string out;
+  out.reserve(line.size() + 8);
+  for (const char c : line) {
+    switch (c) {
+      case '%': out += kEscapePercent; break;
+      case '\t': out.push_back('\t'); break;  // structural: this is the separator
+      case '\n': out += kEscapeNewline; break;
+      case '\r': out += kEscapeCarriageReturn; break;
+      default: out.push_back(c); break;
+    }
+  }
+  return out;
+}
+
+// Reverses escape_record() for one field. Unknown sequences are left alone, so a log
+// written before this escaping existed (which may legitimately contain '%') still
+// replays exactly as it did.
+[[nodiscard]] std::string unescape_field(std::string_view field) {
+  auto matches = [&field](std::size_t at, std::string_view code) {
+    return field.compare(at, code.size(), code) == 0;
+  };
+  std::string out;
+  out.reserve(field.size());
+  for (std::size_t i = 0; i < field.size();) {
+    if (field[i] == '%' && i + 2 < field.size()) {
+      if (matches(i, kEscapePercent)) {
+        out.push_back('%');
+        i += kEscapePercent.size();
+        continue;
+      }
+      if (matches(i, kEscapeTab)) {
+        out.push_back('\t');
+        i += kEscapeTab.size();
+        continue;
+      }
+      if (matches(i, kEscapeNewline)) {
+        out.push_back('\n');
+        i += kEscapeNewline.size();
+        continue;
+      }
+      if (matches(i, kEscapeCarriageReturn)) {
+        out.push_back('\r');
+        i += kEscapeCarriageReturn.size();
+        continue;
+      }
+    }
+    out.push_back(field[i]);
+    ++i;
+  }
+  return out;
+}
+
+// True when a user-supplied string is safe to store and display: printable, no
+// control characters. Rejecting beats silently mangling - a device named with a tab
+// in it is a mistake or an attack, and either way the caller deserves a 400.
+[[nodiscard]] bool is_printable_text(std::string_view value, std::size_t max_length) {
+  if (value.size() > max_length) return false;
+  for (const char c : value) {
+    const auto byte = static_cast<unsigned char>(c);
+    if (byte < 0x20U || byte == 0x7FU) return false;
+  }
+  return true;
+}
+
 Status Store::append_line(const std::string& line) {
   if (log_ == nullptr) {
     return Status{ErrorCode::kInternal, "store log is not open"};
   }
-  const std::string record = line + "\n";
+  const std::string record = escape_record(line) + "\n";
   if (std::fwrite(record.data(), 1, record.size(), log_) != record.size()) {
     return Status{ErrorCode::kUnavailable, "cannot append to the store log"};
   }
@@ -217,8 +300,9 @@ void Store::replay(const std::string& content) {
     start = eol == std::string::npos ? content.size() : eol + 1;
     if (line.empty()) continue;
 
-    const std::vector<std::string> f = split_tabs(line);
+    std::vector<std::string> f = split_tabs(line);
     if (f.empty()) continue;
+    for (std::string& field : f) field = unescape_field(field);
     const std::string& kind = f[0];
 
     if (kind == "U" && f.size() >= 6) {
@@ -537,6 +621,16 @@ std::size_t Store::peer_count() const {
 Result<Device> Store::create_device(const Principal& principal, std::string_view name,
                                   std::string_view platform) {
   const std::lock_guard<std::mutex> lock(mutex_);
+  // A name is echoed back to the client and stored in a line-oriented log: control
+  // characters are rejected here rather than escaped, so a mistake (or an attack)
+  // produces a clear 400 instead of a name that quietly reads back as %0A.
+  if (name.empty() || !is_printable_text(name, 64)) {
+    return make_error(ErrorCode::kInvalidArgument,
+                      "device name must be 1-64 printable characters");
+  }
+  if (!platform.empty() && !is_printable_text(platform, 32)) {
+    return make_error(ErrorCode::kInvalidArgument, "device platform must be printable (max 32)");
+  }
   Device device;
   device.id = random_id("dev_");
   device.user_id = principal.user_id;
@@ -847,6 +941,9 @@ Result<UserRecord> Store::create_user(const Principal& actor, std::string_view e
   const std::string email_key{email};
   if (email_key.empty()) {
     return make_error(ErrorCode::kInvalidArgument, "email is required");
+  }
+  if (!is_printable_text(email_key, 254)) {
+    return make_error(ErrorCode::kInvalidArgument, "email must be printable (max 254)");
   }
   if (password.size() < 8) {
     return make_error(ErrorCode::kInvalidArgument, "password must be at least 8 characters");

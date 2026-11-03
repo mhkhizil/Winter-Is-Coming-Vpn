@@ -25,10 +25,10 @@ store leak cannot be replayed. TTL 3600 s (`RouterOptions::token_ttl_seconds`).
 | POST | `/api/v1/auth/login` | `{email,password}` → `{access_token,token_type,expires_in,user_id}`; password hashes compared in constant time |
 | POST | `/api/v1/auth/logout` | revokes the presented token |
 | GET | `/api/v1/me` | `{user_id,tenant_id,role}` |
-| POST | `/api/v1/devices` | 201 `{id,name,platform}` |
+| POST | `/api/v1/devices` | 201 `{id,name,platform}`; `name` is 1–64 printable chars, control characters are `400` (ADR-0013) |
 | GET | `/api/v1/devices` | caller's devices |
 | PUT | `/api/v1/devices/{id}/key` | 204; accepts **only** a 64-hex public key (ADR-0007) |
-| POST | `/api/v1/peers` | 201; allocates `10.66.0.N/32` + `fd00:66::N/128` |
+| POST | `/api/v1/peers` | 201; allocates `10.66.0.N/32` + `fd00:66::N/128`; with no node registered it is `503 no_node` and nothing is allocated |
 | GET | `/api/v1/peers` | list, including `revoked` tombstones |
 | GET | `/api/v1/peers/{id}` | single peer |
 | GET | `/api/v1/peers/{id}/config` | `text/plain` wg-quick file (base64 server key, no private key) |

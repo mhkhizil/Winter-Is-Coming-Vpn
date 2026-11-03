@@ -635,7 +635,13 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       if (!field(request.body, "name", name)) name = "device";
       if (!field(request.body, "platform", platform)) platform = "linux";
       auto device = options_.store->create_device(who, name, platform);
-      if (!device) return problem(500, "Internal Server Error", "internal");
+      if (!device) {
+        // A rejected name is the caller's mistake, not our failure: 400, not 500.
+        const int status = status_for(device.error().code());
+        return problem(status, status == 400 ? "Bad Request" : "Internal Server Error",
+                       status == 400 ? "invalid_argument" : "internal",
+                       device.error().message());
+      }
       return json(201, "{\"id\":\"" + escape(device->id) + "\",\"name\":\"" +
                            escape(device->name) + "\",\"platform\":\"" +
                            escape(device->platform) + "\"}");
@@ -676,6 +682,21 @@ controlplane::HttpResponse Router::handle(const HttpRequest& request) {
       std::string device_id;
       if (!field(request.body, "device_id", device_id)) {
         return problem(400, "Bad Request", "invalid_argument", "device_id is required");
+      }
+      {
+        // Check for a node *before* allocating anything: previously a peer row was
+        // created and then the response was a 500 because the config could not name
+        // an endpoint, so the client saw a failure for a peer that already existed.
+        // 503 with an actionable message is the honest answer, and it leaves no
+        // half-created state behind.
+        const auto nodes = options_.store->nodes();
+        if (!nodes) {
+          return problem(503, "Service Unavailable", "unavailable", nodes.error().message());
+        }
+        if (nodes->empty()) {
+          return problem(503, "Service Unavailable", "no_node",
+                         "no node registered: an administrator must add one first");
+        }
       }
       auto peer = options_.store->create_peer(who, device_id);
       if (!peer) {
