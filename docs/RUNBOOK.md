@@ -74,6 +74,50 @@ from an empty store), and start again with `VPN_BOOTSTRAP_ROLE=admin`.
 A nonsense value (`administrator`, `root`) is refused at startup — `vpnd` fails to open
 the store and exits `3` (runtime error) rather than storing a role nobody checks.
 
+### 1.2 Making a node actually carry traffic (forwarding, NAT, DNS)
+
+`vpn-dp` decrypts a packet and writes it to the node's TUN device, and does the reverse on
+the way back. That is all it does. For a customer's traffic to reach the internet, three
+things must exist **outside this codebase** — none are implemented here, and skipping them
+produces the worst possible symptom: the client shows **Connected**, the handshake
+succeeds, and nothing loads.
+
+```sh
+# 1. Forwarding (v6 only if client_allowed_ips advertises ::/0)
+sysctl -w net.ipv4.ip_forward=1
+printf 'net.ipv4.ip_forward = 1\n' > /etc/sysctl.d/90-vpn-forward.conf
+
+# 2. NAT the tunnel subnet out of the node's real uplink
+iptables -t nat -A POSTROUTING -s 10.66.0.0/24 -o eth0 -j MASQUERADE
+iptables -A FORWARD -i wg0 -o eth0 -j ACCEPT
+iptables -A FORWARD -i eth0 -o wg0 -m state --state RELATED,ESTABLISHED -j ACCEPT
+```
+
+3. **DNS.** The control plane tells every client `DNS = 10.66.0.1`
+   (`StoreOptions::dns`, defaulting to `server_ipv4`). **Nothing in this repository listens
+   on port 53**, so unless the node runs a resolver bound to `10.66.0.1` (unbound, dnsmasq,
+   `networkd`), every name lookup from a connected device fails while the tunnel looks
+   healthy. Either run one, or set `dns` to a resolver you are willing to send plaintext
+   queries to — that is a privacy decision, so it stays configuration rather than a
+   default we pick for you.
+
+4. **The TUN device needs `CAP_NET_ADMIN`.** On a host where the TUN side cannot open,
+   `vpn-dp` prints `tun=disabled` in its banner and will answer handshakes while carrying
+   no packets. Never read a green handshake as a working tunnel: check the banner, and
+   check that `ip -s link show wg0` counters move.
+
+Registering the node with the right key matters for the same reason — the value to use is
+the `server_pub=` field now printed in full by `vpn-dp` at startup:
+
+```sh
+sudo ./out/build-dp/server/vpn-dp --config /etc/vpn/datad.toml
+# vpn-dp listening on 0.0.0.0:51820 | server_pub=<64 hex> | peers=0 | tun=wg0
+vpnctl nodes add --host vpn.example.com --public-key <that 64 hex>
+```
+
+If the registered key and `server_pub` differ, clients receive a config pointing at a key
+the node does not hold, and the only symptom is that the handshake never completes.
+
 ## 2. A node is not taking new sessions — [M3]
 
 1. `vpnctl node list` → look at `status` (`degraded`/`draining`/`disabled`).

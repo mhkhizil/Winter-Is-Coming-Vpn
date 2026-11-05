@@ -807,10 +807,13 @@ int main(int argc, char** argv) {
     peers.push_back(peer);
   }
 
+  // The full public key, deliberately: this is the value an operator must register with
+  // POST /api/v1/nodes, and every client then receives it in its tunnel config. A prefix
+  // was useless for that (and worse, looked copy-pasteable), and a mismatch between the
+  // registered key and this one shows up only as "the handshake never completes".
   std::printf("vpn-dp listening on %s | server_pub=%s | peers=%zu | tun=%s\n",
-              cfg.listen.c_str(),
-              vpn::to_hex(vpn::as_span(cfg.public_key)).substr(0, 16).c_str(), peers.size(),
-              tun.available() ? cfg.tun.c_str() : "disabled");
+              cfg.listen.c_str(), vpn::to_hex(vpn::as_span(cfg.public_key)).c_str(),
+              peers.size(), tun.available() ? cfg.tun.c_str() : "disabled");
   // Line-buffered output: an operator piping the log must see the banner now, not
   // when the process happens to fill a buffer.
   std::fflush(stdout);
